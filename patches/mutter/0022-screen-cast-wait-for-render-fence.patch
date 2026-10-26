@@ -1,0 +1,171 @@
+diff --git a/src/backends/meta-screen-cast-stream-src.c b/src/backends/meta-screen-cast-stream-src.c
+index cf87d4a..6271382 100644
+--- a/src/backends/meta-screen-cast-stream-src.c
++++ b/src/backends/meta-screen-cast-stream-src.c
+@@ -25,6 +25,7 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <glib/gstdio.h>
++#include <glib-unix.h>
+ #include <pipewire/pipewire.h>
+ #include <spa/debug/pod.h>
+ #include <spa/param/props.h>
+@@ -147,6 +148,12 @@ typedef struct _MetaScreenCastStreamSrcPrivate
+    */
+   GList *dequeued_buffers;
+ 
++  /* PendingQueue entries: recorded dma-buf frames held back until the GPU
++   * has finished writing them. Without explicit sync the consumer relies on
++   * implicit (dma-buf reservation) sync, which some drivers (Qualcomm kgsl)
++   * do not provide. */
++  GList *pending_queues;
++
+   MtkRectangle layout;
+   MtkRegion *damage;
+ 
+@@ -822,6 +829,110 @@ maybe_set_sync_points (MetaScreenCastStreamSrc *src,
+ #endif /* HAVE_NATIVE_BACKEND */
+ }
+ 
++typedef struct
++{
++  MetaScreenCastStreamSrc *src;
++  struct pw_buffer *buffer;
++  guint source_id;
++  int fence_fd;
++} PendingQueue;
++
++static void
++pending_queue_free (PendingQueue *pending)
++{
++  g_clear_handle_id (&pending->source_id, g_source_remove);
++  g_clear_fd (&pending->fence_fd, NULL);
++  g_free (pending);
++}
++
++static gboolean
++on_render_fence_signaled (int          fd,
++                          GIOCondition condition,
++                          gpointer     user_data)
++{
++  PendingQueue *pending = user_data;
++  MetaScreenCastStreamSrcPrivate *priv =
++    meta_screen_cast_stream_src_get_instance_private (pending->src);
++
++  priv->pending_queues = g_list_remove (priv->pending_queues, pending);
++  if (priv->pipewire_stream)
++    pw_stream_queue_buffer (priv->pipewire_stream, pending->buffer);
++
++  pending->source_id = 0;
++  pending_queue_free (pending);
++  return G_SOURCE_REMOVE;
++}
++
++/* Queues `buffer`, but only once the GPU work recorded into it completed
++ * when the consumer cannot synchronise with it on its own. */
++static void
++queue_pw_buffer (MetaScreenCastStreamSrc *src,
++                 struct pw_buffer        *buffer,
++                 gboolean                 recorded_frame)
++{
++  MetaScreenCastStreamSrcPrivate *priv =
++    meta_screen_cast_stream_src_get_instance_private (src);
++  struct spa_buffer *spa_buffer = buffer->buffer;
++  MetaScreenCastStream *stream = meta_screen_cast_stream_src_get_stream (src);
++  MetaScreenCastSession *session = meta_screen_cast_stream_get_session (stream);
++  MetaScreenCast *screen_cast = meta_screen_cast_session_get_screen_cast (session);
++  MetaBackend *backend = meta_screen_cast_get_backend (screen_cast);
++  ClutterBackend *clutter_backend = meta_backend_get_clutter_backend (backend);
++  CoglContext *cogl_context = clutter_backend_get_cogl_context (clutter_backend);
++  PendingQueue *pending;
++  int fence_fd;
++
++  if (!recorded_frame ||
++      spa_buffer->datas[0].type != SPA_DATA_DmaBuf ||
++      spa_buffer_find_meta_data (spa_buffer, SPA_META_SyncTimeline,
++                                 sizeof (struct spa_meta_sync_timeline)) ||
++      !cogl_context_has_winsys_feature (cogl_context, COGL_WINSYS_FEATURE_SYNC_FD))
++    {
++      pw_stream_queue_buffer (priv->pipewire_stream, buffer);
++      return;
++    }
++
++  fence_fd = cogl_context_get_latest_sync_fd (cogl_context);
++  if (fence_fd < 0)
++    {
++      pw_stream_queue_buffer (priv->pipewire_stream, buffer);
++      return;
++    }
++
++  pending = g_new0 (PendingQueue, 1);
++  pending->src = src;
++  pending->buffer = buffer;
++  pending->fence_fd = fence_fd;
++  pending->source_id = g_unix_fd_add (fence_fd, G_IO_IN, on_render_fence_signaled, pending);
++  priv->pending_queues = g_list_append (priv->pending_queues, pending);
++}
++
++/* Hands every held-back buffer to the consumer now, or forgets it when
++ * `buffer` is being removed. */
++static void
++flush_pending_queues (MetaScreenCastStreamSrc *src,
++                      struct pw_buffer        *removed_buffer)
++{
++  MetaScreenCastStreamSrcPrivate *priv =
++    meta_screen_cast_stream_src_get_instance_private (src);
++  GList *l = priv->pending_queues;
++
++  while (l)
++    {
++      PendingQueue *pending = l->data;
++      GList *next = l->next;
++
++      if (!removed_buffer || pending->buffer == removed_buffer)
++        {
++          priv->pending_queues = g_list_delete_link (priv->pending_queues, l);
++          if (!removed_buffer && priv->pipewire_stream)
++            pw_stream_queue_buffer (priv->pipewire_stream, pending->buffer);
++          pending_queue_free (pending);
++        }
++      l = next;
++    }
++}
++
+ static gboolean
+ do_record_frame (MetaScreenCastStreamSrc   *src,
+                  MetaScreenCastRecordFlag   flags,
+@@ -1305,7 +1416,8 @@ meta_screen_cast_stream_src_record_frame_with_timestamp (MetaScreenCastStreamSrc
+       meta_topic (META_DEBUG_SCREEN_CAST, "Queuing unsequenced PipeWire buffer");
+     }
+ 
+-  pw_stream_queue_buffer (priv->pipewire_stream, buffer);
++  queue_pw_buffer (src, buffer,
++                   !!(record_result & META_SCREEN_CAST_RECORD_RESULT_RECORDED_FRAME));
+ 
+   return record_result;
+ }
+@@ -1397,6 +1509,7 @@ meta_screen_cast_stream_src_disable (MetaScreenCastStreamSrc *src)
+     meta_screen_cast_stream_src_get_instance_private (src);
+ 
+   META_SCREEN_CAST_STREAM_SRC_GET_CLASS (src)->disable (src);
++  flush_pending_queues (src, NULL);
+ 
+   priv->is_enabled = FALSE;
+ }
+@@ -2397,6 +2510,8 @@ on_stream_remove_buffer (void             *data,
+   struct spa_buffer *spa_buffer = buffer->buffer;
+   struct spa_data *spa_data = &spa_buffer->datas[0];
+ 
++  flush_pending_queues (src, buffer);
++
+   if (spa_data->type == SPA_DATA_DmaBuf)
+     {
+       maybe_remove_syncobj (src, buffer);
+@@ -2671,6 +2786,7 @@ meta_screen_cast_stream_src_dispose (GObject *object)
+ 
+   if (meta_screen_cast_stream_src_is_enabled (src))
+     meta_screen_cast_stream_src_disable (src);
++  flush_pending_queues (src, NULL);
+ 
+   g_hash_table_iter_init (&modifierIter,
+                           priv->modifiers);

@@ -1,0 +1,6 @@
+/* A transparent status bar over the wallpaper on the phone's screen; the
+   theme sets the panel background with !important. */
+#panel.screen-safe-area-transparent,
+#panel.screen-safe-area-transparent:overview {
+  background-color: transparent !important;
+}

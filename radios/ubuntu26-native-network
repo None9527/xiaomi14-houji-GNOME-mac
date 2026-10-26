@@ -1,0 +1,982 @@
+#!/usr/bin/python3
+"""Native radio services for the desktop. Android remains the only radio owner.
+
+Presents Android's Wi-Fi and mobile data as NetworkManager (plus ModemManager
+for signal and operator), Bluetooth as BlueZ, and airplane mode on a small
+private interface, so GNOME's own panels and quick settings work unchanged.
+
+No passwords are persisted or logged here. No Linux routes or DHCP are changed.
+"""
+import concurrent.futures
+import hashlib
+import json
+import os
+import pathlib
+import signal
+import socket
+import struct
+import subprocess
+import time
+import uuid
+
+import dbus
+import dbus.service
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+NM = 'org.freedesktop.NetworkManager'
+BASE = '/org/freedesktop/NetworkManager'
+DEV = BASE + '/Devices/1'
+PROP = 'org.freedesktop.DBus.Properties'
+OM = 'org.freedesktop.DBus.ObjectManager'
+WIRE = NM + '.Device.Wireless'
+DEVICE = NM + '.Device'
+APIF = NM + '.AccessPoint'
+SETTINGS = NM + '.Settings'
+CON = SETTINGS + '.Connection'
+ACTIVE = NM + '.Connection.Active'
+MODEM_DEV = BASE + '/Devices/2'
+NM_MODEM = DEVICE + '.Modem'
+MOBILE_PROFILE = BASE + '/Settings/mobile'
+MOBILE_ACTIVE = BASE + '/ActiveConnection/mobile'
+
+MM = 'org.freedesktop.ModemManager1'
+MM_BASE = '/org/freedesktop/ModemManager1'
+MM_MODEM_PATH = MM_BASE + '/Modem/0'
+MM_MODEM = MM + '.Modem'
+MM_3GPP = MM + '.Modem.Modem3gpp'
+
+BLUEZ = 'org.bluez'
+ADAPTER_PATH = '/org/bluez/hci0'
+ADAPTER = BLUEZ + '.Adapter1'
+BT_DEVICE = BLUEZ + '.Device1'
+
+RADIOS = 'local.ubuntu26.Radios'
+RADIOS_PATH = '/local/ubuntu26/Radios'
+
+SCREEN = 'local.ubuntu26.Display'
+SCREEN_PATH = '/local/ubuntu26/Display'
+U = dbus.UInt32
+O = dbus.ObjectPath
+B = dbus.Boolean
+S = dbus.String
+
+def paths(values=()):
+    return dbus.Array([O(v) for v in values], signature='o')
+
+def error(message, suffix='NotSupported', domain=NM):
+    e = dbus.DBusException(message)
+    e._dbus_error_name = domain + '.' + suffix
+    return e
+
+def bluez_error(message, suffix='Failed'):
+    return error(message, suffix, BLUEZ + '.Error')
+
+def android(request):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(17)
+        sock.connect('\0ubuntu26-native-network-agent')
+        if struct.unpack('3i', sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1] != 0:
+            raise error('Android agent has an unexpected UID', 'PermissionDenied')
+        sock.sendall(json.dumps(request, ensure_ascii=False).encode() + b'\n')
+        with sock.makefile('rb') as stream:
+            reply = json.loads(stream.readline(1024 * 1024))
+        if not reply.get('ok'):
+            raise error('Android rejected operation: ' + reply.get('error', 'unknown'), 'Failed')
+        return reply['data']
+
+class Object(dbus.service.Object):
+    """An exported object; `manager` is the ObjectManager that lists it
+    (NetworkManager's by default, False for none)."""
+
+    def __init__(self, service, path, interfaces, manager=None):
+        self.service, self.path, self.interfaces = service, path, interfaces
+        self.manager = service.manager if manager is None else manager
+        # (interface, property) -> callable(value) for writable properties.
+        self.setters = {}
+        super().__init__(service.bus, path)
+        service.objects[path] = self
+        if self.manager:
+            self.manager.objects[path] = self
+            self.manager.InterfacesAdded(O(path), interfaces)
+
+    @dbus.service.method(PROP, in_signature='s', out_signature='a{sv}')
+    def GetAll(self, iface):
+        return self.interfaces.get(str(iface), {})
+
+    @dbus.service.method(PROP, in_signature='ss', out_signature='v')
+    def Get(self, iface, key):
+        if str(key) not in self.interfaces.get(str(iface), {}):
+            raise error('Unknown property', 'UnknownProperty')
+        return self.interfaces[str(iface)][str(key)]
+
+    @dbus.service.method(PROP, in_signature='ssv', out_signature='', sender_keyword='sender')
+    def Set(self, iface, key, value, sender=None):
+        self.service.authorize(sender)
+        setter = self.setters.get((str(iface), str(key)))
+        if not setter:
+            raise error('Property is not writable')
+        setter(value)
+
+    @dbus.service.signal(PROP, signature='sa{sv}as')
+    def PropertiesChanged(self, iface, changed, invalidated):
+        pass
+
+    def update(self, iface, changes):
+        props = self.interfaces[iface]
+        delta = {k: v for k, v in changes.items() if props.get(k) != v}
+        if delta:
+            props.update(delta)
+            self.PropertiesChanged(iface, delta, [])
+
+    def remove(self):
+        if self.manager:
+            self.manager.InterfacesRemoved(O(self.path), list(self.interfaces))
+            self.manager.objects.pop(self.path, None)
+        self.service.objects.pop(self.path, None)
+        self.remove_from_connection()
+
+class Manager(dbus.service.Object):
+    def __init__(self, service, path='/org/freedesktop'):
+        self.service = service
+        self.objects = {}
+        super().__init__(service.bus, path)
+
+    @dbus.service.method(OM, in_signature='', out_signature='a{oa{sa{sv}}}')
+    def GetManagedObjects(self):
+        return {O(k): v.interfaces for k, v in self.objects.items()}
+
+    @dbus.service.signal(OM, signature='oa{sa{sv}}')
+    def InterfacesAdded(self, path, interfaces):
+        pass
+
+    @dbus.service.signal(OM, signature='oas')
+    def InterfacesRemoved(self, path, interfaces):
+        pass
+
+class AccessPoint(Object):
+    def __init__(self, service, ap):
+        path = BASE + '/AccessPoint/a' + hashlib.sha256(ap['bssid'].encode()).hexdigest()[:16]
+        super().__init__(service, path, {APIF: {}})
+        self.refresh(ap)
+
+    def refresh(self, ap):
+        self.ap = ap
+        caps = ap.get('capabilities', '')
+        secure = any(x in caps for x in ('WPA', 'RSN', 'WEP', 'SAE', 'OWE'))
+        flags = 0
+        if 'PSK' in caps: flags |= 0x188
+        if 'SAE' in caps: flags |= 0x488
+        if 'EAP' in caps: flags |= 0x288
+        if 'OWE' in caps: flags |= 0x888
+        self.update(APIF, {
+            'Ssid': dbus.ByteArray(ap['ssid'].encode()), 'HwAddress': S(ap['bssid']),
+            'Strength': dbus.Byte(max(0, min(100, (ap['rssi'] + 100) * 2))),
+            'Frequency': U(ap['frequency']), 'Flags': U(1 if secure else 0),
+            'WpaFlags': U(flags if 'WPA-' in caps else 0), 'RsnFlags': U(flags if any(x in caps for x in ('RSN', 'WPA2', 'WPA3')) else 0),
+            'Mode': U(2), 'MaxBitrate': U(0), 'LastSeen': dbus.Int32(int(time.monotonic())),
+        })
+
+class Profile(Object):
+    def __init__(self, service, profile):
+        self.profile = profile
+        number = profile['networkId']
+        path = BASE + '/Settings/' + str(number + 1)
+        super().__init__(service, path, {CON: {'Unsaved': B(False), 'Flags': U(0), 'Filename': S('')}})
+
+    def settings(self):
+        p = self.profile
+        value = {
+            'connection': {'id': S(p['ssid']), 'uuid': S(str(uuid.uuid5(uuid.NAMESPACE_URL, 'android-wifi:' + str(p['networkId']) + ':' + p['ssid']))),
+                           'type': S('802-11-wireless'), 'autoconnect': B(True)},
+            '802-11-wireless': {'ssid': dbus.ByteArray(p['ssid'].encode()), 'mode': S('infrastructure')},
+            'ipv4': {'method': S('auto')}, 'ipv6': {'method': S('auto')},
+        }
+        keys = p.get('keyManagement', '')
+        if keys != '{0}':
+            value['802-11-wireless-security'] = {'key-mgmt': S('sae' if '8' in keys else 'wpa-psk'), 'psk-flags': U(1)}
+        return value
+
+    @dbus.service.method(CON, in_signature='', out_signature='a{sa{sv}}')
+    def GetSettings(self):
+        return self.settings()
+
+    @dbus.service.method(CON, in_signature='s', out_signature='a{sa{sv}}', sender_keyword='sender')
+    def GetSecrets(self, setting, sender=None):
+        self.service.authorize(sender)
+        raise error('Saved passwords remain in Android', 'Settings.Connection.SecretsUnavailable')
+
+    @dbus.service.method(CON, in_signature='', out_signature='', sender_keyword='sender')
+    def Delete(self, sender=None):
+        self.service.authorize(sender)
+        raise error('Forget networks in Android settings for now')
+
+class PendingProfile(Profile):
+    def __init__(self, service, settings):
+        self.value = settings
+        self.profile = {'networkId': -1, 'ssid': bytes(settings['802-11-wireless']['ssid']).decode()}
+        path = BASE + '/Settings/pending' + uuid.uuid4().hex
+        Object.__init__(self, service, path, {CON: {'Unsaved': B(True), 'Flags': U(2), 'Filename': S('')}})
+
+    def settings(self):
+        return self.value
+
+class Settings(Object):
+    def __init__(self, service):
+        super().__init__(service, BASE + '/Settings', {SETTINGS: {'Connections': paths(), 'Hostname': S('mi14'), 'CanModify': B(False)}})
+
+    @dbus.service.method(SETTINGS, in_signature='', out_signature='ao')
+    def ListConnections(self):
+        return paths(self.service.profiles)
+
+    @dbus.service.signal(SETTINGS, signature='o')
+    def NewConnection(self, path):
+        pass
+
+class Device(Object):
+    def __init__(self, service):
+        super().__init__(service, DEV, {
+            DEVICE: {'DeviceType': U(2), 'Interface': S('wlan0'), 'IpInterface': S('wlan0'),
+                     'Udi': S('/sys/class/net/wlan0'), 'Driver': S('android-wifi'), 'DriverVersion': S('Binder'),
+                     'FirmwareVersion': S(''), 'Capabilities': U(1), 'Managed': B(True), 'Autoconnect': B(True),
+                     'FirmwareMissing': B(False), 'NmPluginMissing': B(False), 'Real': B(True),
+                     'State': U(30), 'StateReason': dbus.Struct((U(30), U(0))),
+                     'Ip4Config': O('/'), 'Ip6Config': O('/'), 'Dhcp4Config': O('/'), 'Dhcp6Config': O('/'),
+                     'ActiveConnection': O('/'), 'AvailableConnections': paths(), 'Metered': U(0),
+                     'Mtu': U(1500), 'Ip4Connectivity': U(0), 'Ip6Connectivity': U(0)},
+            WIRE: {'AccessPoints': paths(), 'ActiveAccessPoint': O('/'), 'HwAddress': S(''),
+                   'PermHwAddress': S(''), 'Mode': U(2), 'Bitrate': U(0), 'WirelessCapabilities': U(0x38),
+                   'LastScan': dbus.Int64(-1)},
+        })
+
+    @dbus.service.method(WIRE, in_signature='', out_signature='ao')
+    def GetAllAccessPoints(self):
+        return paths(self.service.aps)
+
+    @dbus.service.method(WIRE, in_signature='', out_signature='ao')
+    def GetAccessPoints(self):
+        return paths(self.service.aps)
+
+    @dbus.service.method(WIRE, in_signature='a{sv}', out_signature='', sender_keyword='sender', async_callbacks=('done','fail'))
+    def RequestScan(self, options, done, fail, sender=None):
+        self.service.authorize(sender)
+        if options:
+            fail(error('Directed scans are not supported'))
+            return
+        self.service.request({'action': 'scan'}, lambda result: done(), fail)
+
+    @dbus.service.method(DEVICE, in_signature='', out_signature='', sender_keyword='sender', async_callbacks=('done','fail'))
+    def Disconnect(self, done, fail, sender=None):
+        self.service.authorize(sender)
+        self.service.request({'action':'disconnect'}, lambda result: done(), fail)
+
+    @dbus.service.signal(WIRE, signature='o')
+    def AccessPointAdded(self, path): pass
+
+    @dbus.service.signal(WIRE, signature='o')
+    def AccessPointRemoved(self, path): pass
+
+    @dbus.service.signal(DEVICE, signature='uuu')
+    def StateChanged(self, new, old, reason): pass
+
+class AgentManager(Object):
+    def __init__(self, service):
+        super().__init__(service, BASE + '/AgentManager', {NM + '.AgentManager': {}})
+        self.agents = {}
+
+    @dbus.service.method(NM + '.AgentManager', in_signature='s', out_signature='', sender_keyword='sender')
+    def Register(self, identifier, sender=None):
+        self.RegisterWithCapabilities(identifier, 0, sender)
+
+    @dbus.service.method(NM + '.AgentManager', in_signature='su', out_signature='', sender_keyword='sender')
+    def RegisterWithCapabilities(self, identifier, caps, sender=None):
+        self.service.authorize(sender)
+        self.agents[str(sender)] = self.service.bus.get_object(sender, BASE + '/SecretAgent', introspect=False)
+
+    @dbus.service.method(NM + '.AgentManager', in_signature='', out_signature='', sender_keyword='sender')
+    def Unregister(self, sender=None):
+        self.agents.pop(str(sender), None)
+
+class NetworkManager(Object):
+    def __init__(self, service):
+        super().__init__(service, BASE, {NM: {
+            'Version': S('1.54.3'), 'VersionInfo': dbus.Array([U(0x013603)], signature='u'),
+            'State': U(20), 'Startup': B(False), 'NetworkingEnabled': B(True),
+            'WirelessEnabled': B(True), 'WirelessHardwareEnabled': B(True),
+            'WwanEnabled': B(False), 'WwanHardwareEnabled': B(False),
+            'Devices': paths([DEV, MODEM_DEV]), 'AllDevices': paths([DEV, MODEM_DEV]), 'ActiveConnections': paths(),
+            'PrimaryConnection': O('/'), 'ActivatingConnection': O('/'), 'PrimaryConnectionType': S(''),
+            'Connectivity': U(1), 'Metered': U(0), 'Capabilities': dbus.Array([], signature='u'),
+        }})
+        self.setters[(NM, 'WirelessEnabled')] = lambda value: service.control(
+            {'action': 'wifi', 'enabled': bool(value)})
+        self.setters[(NM, 'WwanEnabled')] = lambda value: service.control(
+            {'action': 'mobile-data', 'enabled': bool(value)})
+
+    @dbus.service.method(NM, in_signature='', out_signature='ao')
+    def GetDevices(self): return paths([DEV, MODEM_DEV])
+
+    @dbus.service.method(NM, in_signature='', out_signature='ao')
+    def GetAllDevices(self): return paths([DEV, MODEM_DEV])
+
+    @dbus.service.method(NM, in_signature='', out_signature='a{ss}')
+    def GetPermissions(self):
+        return {NM.lower() + '.' + p: 'yes' for p in ('enable-disable-wifi', 'network-control', 'wifi.scan')}
+
+    @dbus.service.method(NM, in_signature='', out_signature='u')
+    def CheckConnectivity(self): return self.interfaces[NM]['Connectivity']
+
+    @dbus.service.method(NM, in_signature='ooo', out_signature='o', sender_keyword='sender', async_callbacks=('done','fail'))
+    def ActivateConnection(self, connection, device, specific, done, fail, sender=None):
+        self.service.authorize(sender)
+        if str(connection) == MOBILE_PROFILE:
+            self.service.request({'action': 'mobile-data', 'enabled': True},
+                                 lambda result: done(O(MOBILE_ACTIVE)), fail)
+            return
+        if str(device) != DEV or str(connection) not in self.service.profiles:
+            fail(error('Unknown device or profile', 'UnknownConnection'))
+            return
+        profile = self.service.profiles[str(connection)]
+        self.service.connect({'action':'connect','networkId':profile.profile['networkId']}, profile, done, fail)
+
+    @dbus.service.method(NM, in_signature='a{sa{sv}}oo', out_signature='oo', sender_keyword='sender', async_callbacks=('done','fail'))
+    def AddAndActivateConnection(self, settings, device, specific, done, fail, sender=None):
+        self.service.authorize(sender)
+        self.service.add_activate(settings, device, lambda cp, ac: done(cp, ac), fail)
+
+    @dbus.service.method(NM, in_signature='a{sa{sv}}ooa{sv}', out_signature='ooa{sv}', sender_keyword='sender', async_callbacks=('done','fail'))
+    def AddAndActivateConnection2(self, settings, device, specific, options, done, fail, sender=None):
+        self.service.authorize(sender)
+        if options:
+            fail(error('Connection options are not supported'))
+            return
+        self.service.add_activate(settings, device, lambda cp, ac: done(cp, ac, dbus.Dictionary({},signature='sv')), fail)
+
+    @dbus.service.method(NM, in_signature='o', out_signature='', sender_keyword='sender', async_callbacks=('done','fail'))
+    def DeactivateConnection(self, connection, done, fail, sender=None):
+        self.service.authorize(sender)
+        if str(connection) == MOBILE_ACTIVE:
+            self.service.request({'action': 'mobile-data', 'enabled': False}, lambda result: done(), fail)
+            return
+        if str(connection) != self.service.active_path:
+            fail(error('Unknown active connection'))
+            return
+        self.service.request({'action':'disconnect'}, lambda result: done(), fail)
+
+    @dbus.service.signal(NM, signature='u')
+    def StateChanged(self, state): pass
+
+# --- Mobile data --------------------------------------------------------
+
+# NM.DeviceModemCapabilities: GSM_UMTS | LTE
+MODEM_CAPABILITIES = 0x4 | 0x8
+
+# Android TelephonyManager.NETWORK_TYPE_* -> ModemManager access technology bits.
+ACCESS_TECHNOLOGIES = {
+    1: 1 << 1, 2: 1 << 4, 16: 1 << 1,                  # GPRS, EDGE, GSM
+    3: 1 << 5, 8: 1 << 6, 9: 1 << 7, 10: 1 << 8,       # UMTS, HSDPA, HSUPA, HSPA
+    15: 1 << 9, 17: 1 << 5,                            # HSPA+, TD-SCDMA
+    13: 1 << 14, 19: 1 << 14,                          # LTE, LTE-CA
+    20: 1 << 15,                                       # NR
+}
+
+class ModemDevice(Object):
+    """The phone's mobile data link as an NM modem device."""
+
+    def __init__(self, service):
+        super().__init__(service, MODEM_DEV, {
+            DEVICE: {'DeviceType': U(8), 'Interface': S('rmnet'), 'IpInterface': S(''),
+                     'Udi': S(MM_MODEM_PATH), 'Driver': S('android-telephony'), 'DriverVersion': S('Binder'),
+                     'FirmwareVersion': S(''), 'Capabilities': U(1), 'Managed': B(True), 'Autoconnect': B(True),
+                     'FirmwareMissing': B(False), 'NmPluginMissing': B(False), 'Real': B(True),
+                     'State': U(20), 'StateReason': dbus.Struct((U(20), U(0))),
+                     'Ip4Config': O('/'), 'Ip6Config': O('/'), 'Dhcp4Config': O('/'), 'Dhcp6Config': O('/'),
+                     'ActiveConnection': O('/'), 'AvailableConnections': paths([MOBILE_PROFILE]), 'Metered': U(1),
+                     'Mtu': U(1500), 'Ip4Connectivity': U(0), 'Ip6Connectivity': U(0)},
+            NM_MODEM: {'ModemCapabilities': U(MODEM_CAPABILITIES), 'CurrentCapabilities': U(MODEM_CAPABILITIES),
+                       'DeviceId': S(''), 'OperatorCode': S(''), 'Apn': S('')},
+        })
+
+    @dbus.service.method(DEVICE, in_signature='', out_signature='', sender_keyword='sender', async_callbacks=('done','fail'))
+    def Disconnect(self, done, fail, sender=None):
+        self.service.authorize(sender)
+        self.service.request({'action': 'mobile-data', 'enabled': False}, lambda result: done(), fail)
+
+    @dbus.service.signal(DEVICE, signature='uuu')
+    def StateChanged(self, new, old, reason): pass
+
+class MobileProfile(Object):
+    """Android's mobile data, as one read-only NM connection."""
+
+    def __init__(self, service):
+        super().__init__(service, MOBILE_PROFILE, {CON: {'Unsaved': B(False), 'Flags': U(0), 'Filename': S('')}})
+        self.name = '移动数据'
+
+    def settings(self):
+        return {'connection': {'id': S(self.name), 'uuid': S(str(uuid.uuid5(uuid.NAMESPACE_URL, 'android-mobile-data'))),
+                               'type': S('gsm'), 'autoconnect': B(True)},
+                'gsm': {'auto-config': B(True)},
+                'ipv4': {'method': S('auto')}, 'ipv6': {'method': S('auto')}}
+
+    @dbus.service.method(CON, in_signature='', out_signature='a{sa{sv}}')
+    def GetSettings(self):
+        return self.settings()
+
+    @dbus.service.method(CON, in_signature='s', out_signature='a{sa{sv}}', sender_keyword='sender')
+    def GetSecrets(self, setting, sender=None):
+        return {}
+
+    @dbus.service.method(CON, in_signature='', out_signature='', sender_keyword='sender')
+    def Delete(self, sender=None):
+        self.service.authorize(sender)
+        raise error('Mobile data is configured in Android settings')
+
+class Modem(Object):
+    """ModemManager view of the modem: signal quality and operator for GNOME."""
+
+    def __init__(self, service):
+        super().__init__(service, MM_MODEM_PATH, {
+            MM_MODEM: {'Manufacturer': S('Xiaomi'), 'Model': S('Xiaomi 14'), 'Revision': S(''),
+                       'Plugin': S('android'), 'Drivers': dbus.Array(['android-telephony'], signature='s'),
+                       'PrimaryPort': S('rmnet'), 'EquipmentIdentifier': S(''), 'DeviceIdentifier': S('android'),
+                       'UnlockRequired': U(1), 'Sim': O('/'), 'OwnNumbers': dbus.Array([], signature='s'),
+                       'PowerState': U(3), 'State': dbus.Int32(3), 'StateFailedReason': U(0),
+                       'AccessTechnologies': U(0), 'SignalQuality': dbus.Struct((U(0), B(False))),
+                       'CurrentCapabilities': U(0x8 | 0x4), 'MaxBearers': U(1), 'MaxActiveBearers': U(1)},
+            MM_3GPP: {'Imei': S(''), 'RegistrationState': U(0), 'OperatorCode': S(''), 'OperatorName': S(''),
+                      'EnabledFacilityLocks': U(0)},
+        }, service.mm_manager)
+
+# --- Bluetooth ----------------------------------------------------------
+
+def bluetooth_icon(device_class):
+    major, minor = (device_class >> 8) & 0x1f, (device_class >> 2) & 0x3f
+    if major == 0x01: return 'computer'
+    if major == 0x02: return 'phone'
+    if major == 0x04:
+        return {0x01: 'audio-headset', 0x02: 'audio-headset', 0x06: 'audio-headphones',
+                0x08: 'audio-card', 0x0b: 'video-display', 0x0c: 'camera-video'}.get(minor, 'audio-card')
+    if major == 0x05:
+        if minor & 0x10: return 'input-keyboard'
+        if minor & 0x20: return 'input-mouse'
+        return 'input-gaming' if (minor & 0x0f) in (0x01, 0x02) else 'input-tablet'
+    if major == 0x06: return 'printer' if minor & 0x20 else 'camera-photo'
+    return 'bluetooth'
+
+def bluetooth_path(address):
+    return ADAPTER_PATH + '/dev_' + address.upper().replace(':', '_')
+
+class BluezRoot(Object):
+    """org.bluez manager objects: agents and profiles are accepted but unused,
+    since Android pairs devices and owns every profile."""
+
+    def __init__(self, service):
+        super().__init__(service, '/org/bluez', {BLUEZ + '.AgentManager1': {}, BLUEZ + '.ProfileManager1': {}},
+                         service.bluez_manager)
+
+    @dbus.service.method(BLUEZ + '.AgentManager1', in_signature='os', out_signature='')
+    def RegisterAgent(self, agent, capability): pass
+
+    @dbus.service.method(BLUEZ + '.AgentManager1', in_signature='o', out_signature='')
+    def UnregisterAgent(self, agent): pass
+
+    @dbus.service.method(BLUEZ + '.AgentManager1', in_signature='o', out_signature='')
+    def RequestDefaultAgent(self, agent): pass
+
+    @dbus.service.method(BLUEZ + '.ProfileManager1', in_signature='osa{sv}', out_signature='')
+    def RegisterProfile(self, profile, uuid_, options): pass
+
+    @dbus.service.method(BLUEZ + '.ProfileManager1', in_signature='o', out_signature='')
+    def UnregisterProfile(self, profile): pass
+
+class Adapter(Object):
+    def __init__(self, service):
+        super().__init__(service, ADAPTER_PATH, {ADAPTER: {
+            'Address': S('00:00:00:00:00:00'), 'AddressType': S('public'), 'Name': S('Android'),
+            'Alias': S('Android'), 'Class': U(0x5a020c), 'Powered': B(False), 'PowerState': S('off'),
+            'Discoverable': B(False), 'DiscoverableTimeout': U(180), 'Pairable': B(False),
+            'PairableTimeout': U(0), 'Discovering': B(False), 'UUIDs': dbus.Array([], signature='s'),
+            'Modalias': S(''), 'Roles': dbus.Array(['central', 'peripheral'], signature='s'),
+        }}, service.bluez_manager)
+        self.setters[(ADAPTER, 'Powered')] = lambda value: service.control(
+            {'action': 'bluetooth', 'enabled': bool(value)})
+        self.setters[(ADAPTER, 'Alias')] = lambda value: service.control(
+            {'action': 'bluetooth-name', 'name': str(value)})
+        self.setters[(ADAPTER, 'Discoverable')] = self._refuse_discovery
+        self.setters[(ADAPTER, 'Pairable')] = self._refuse_discovery
+
+    def _refuse_discovery(self, value):
+        if value:
+            raise bluez_error('Pair new devices in the phone\'s Bluetooth settings', 'NotSupported')
+
+    @dbus.service.method(ADAPTER, in_signature='', out_signature='')
+    def StartDiscovery(self):
+        raise bluez_error('Pair new devices in the phone\'s Bluetooth settings', 'NotSupported')
+
+    @dbus.service.method(ADAPTER, in_signature='', out_signature='')
+    def StopDiscovery(self): pass
+
+    @dbus.service.method(ADAPTER, in_signature='a{sv}', out_signature='')
+    def SetDiscoveryFilter(self, properties): pass
+
+    @dbus.service.method(ADAPTER, in_signature='', out_signature='as')
+    def GetDiscoveryFilters(self): return dbus.Array([], signature='s')
+
+    @dbus.service.method(ADAPTER, in_signature='o', out_signature='', sender_keyword='sender', async_callbacks=('done','fail'))
+    def RemoveDevice(self, path, done, fail, sender=None):
+        self.service.authorize(sender)
+        device = self.service.bt_devices.get(str(path))
+        if not device:
+            fail(bluez_error('Unknown device', 'DoesNotExist'))
+            return
+        self.service.request({'action': 'bluetooth-forget', 'address': device.address},
+                             lambda result: done(), fail)
+
+class BluetoothDevice(Object):
+    def __init__(self, service, address):
+        self.address = address
+        super().__init__(service, bluetooth_path(address), {BT_DEVICE: {
+            'Address': S(address), 'AddressType': S('public'), 'Name': S(address), 'Alias': S(address),
+            'Class': U(0), 'Icon': S('bluetooth'), 'Paired': B(True), 'Bonded': B(True), 'Trusted': B(True),
+            'Blocked': B(False), 'LegacyPairing': B(False), 'Connected': B(False), 'ServicesResolved': B(False),
+            'UUIDs': dbus.Array([], signature='s'), 'Adapter': O(ADAPTER_PATH), 'WakeAllowed': B(False),
+        }}, service.bluez_manager)
+
+    def refresh(self, entry):
+        name = entry.get('name') or self.address
+        device_class = int(entry.get('class') or 0)
+        connected = bool(entry.get('connected'))
+        self.update(BT_DEVICE, {'Name': S(name), 'Alias': S(entry.get('alias') or name),
+                                'Class': U(device_class), 'Icon': S(bluetooth_icon(device_class)),
+                                'Connected': B(connected), 'ServicesResolved': B(connected)})
+
+    def _set_connected(self, connected, done, fail):
+        self.service.request({'action': 'bluetooth-connect', 'address': self.address, 'connected': connected},
+                             lambda result: done(), fail)
+
+    @dbus.service.method(BT_DEVICE, in_signature='', out_signature='', sender_keyword='sender', async_callbacks=('done','fail'))
+    def Connect(self, done, fail, sender=None):
+        self.service.authorize(sender)
+        self._set_connected(True, done, fail)
+
+    @dbus.service.method(BT_DEVICE, in_signature='', out_signature='', sender_keyword='sender', async_callbacks=('done','fail'))
+    def Disconnect(self, done, fail, sender=None):
+        self.service.authorize(sender)
+        self._set_connected(False, done, fail)
+
+    @dbus.service.method(BT_DEVICE, in_signature='s', out_signature='', sender_keyword='sender', async_callbacks=('done','fail'))
+    def ConnectProfile(self, profile, done, fail, sender=None):
+        self.service.authorize(sender)
+        self._set_connected(True, done, fail)
+
+    @dbus.service.method(BT_DEVICE, in_signature='s', out_signature='', sender_keyword='sender', async_callbacks=('done','fail'))
+    def DisconnectProfile(self, profile, done, fail, sender=None):
+        self.service.authorize(sender)
+        self._set_connected(False, done, fail)
+
+    @dbus.service.method(BT_DEVICE, in_signature='', out_signature='')
+    def Pair(self):
+        raise bluez_error('Already paired', 'AlreadyExists')
+
+    @dbus.service.method(BT_DEVICE, in_signature='', out_signature='')
+    def CancelPairing(self): pass
+
+# --- Airplane mode -------------------------------------------------------
+
+class Radios(Object):
+    """Airplane mode for the desktop's rfkill service (session bus)."""
+
+    def __init__(self, service):
+        super().__init__(service, RADIOS_PATH, {RADIOS: {'AirplaneMode': B(False)}}, False)
+        self.setters[(RADIOS, 'AirplaneMode')] = lambda value: service.control(
+            {'action': 'airplane', 'enabled': bool(value)})
+
+# --- Panel shape ---------------------------------------------------------
+
+class Screen(Object):
+    """The phone panel's shape in its current rotation (physical pixels), so
+    the desktop can keep its chrome clear of the cutout and rounded corners."""
+
+    def __init__(self, service):
+        super().__init__(service, SCREEN_PATH, {SCREEN: {
+            'Rotation': U(0), 'Width': U(0), 'Height': U(0),
+            'SafeInsets': dbus.Struct((dbus.Int32(0),) * 4, signature='iiii'),
+            'Cutouts': dbus.Array([], signature='(iiii)'), 'CornerRadius': U(0),
+        }}, False)
+
+    def apply(self, data):
+        self.update(SCREEN, {
+            'Rotation': U(data['rotation']), 'Width': U(data['width']), 'Height': U(data['height']),
+            'SafeInsets': dbus.Struct([dbus.Int32(v) for v in data['insets']], signature='iiii'),
+            'Cutouts': dbus.Array([dbus.Struct([dbus.Int32(v) for v in r], signature='iiii')
+                                   for r in data['cutouts']], signature='(iiii)'),
+            'CornerRadius': U(data['cornerRadius']),
+        })
+
+    @dbus.service.method(SCREEN, in_signature='', out_signature='a{sv}', async_callbacks=('done', 'fail'))
+    def Refresh(self, done, fail):
+        """Reads the shape now (after a rotation) and returns the properties."""
+        def received(data):
+            self.apply(data)
+            done(self.interfaces[SCREEN])
+        self.service.request({'action': 'display'}, received, fail)
+
+class Service:
+    def __init__(self):
+        self.bus = dbus.SystemBus()
+        self.objects, self.aps, self.profiles = {}, {}, {}
+        self.manager = None
+        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.polling = False
+        self.active_path, self.active_profile = '/', None
+        self.activation_started = 0
+        self.pending = None
+        self.manager = Manager(self)
+        self.mm_manager = Manager(self, MM_BASE)
+        self.bluez_manager = Manager(self, '/')
+        self.root = NetworkManager(self)
+        self.device = Device(self)
+        self.modem_device = ModemDevice(self)
+        self.settings = Settings(self)
+        self.mobile_profile = MobileProfile(self)
+        self.mobile_active = None
+        self.agent = AgentManager(self)
+        self.modem = Modem(self)
+        self.bluez_root = BluezRoot(self)
+        self.adapter = Adapter(self)
+        self.bt_devices = {}
+        self.radios = Radios(self)
+        self.screen = Screen(self)
+        self.refresh(android({'action':'snapshot'}))
+        self.screen.apply(android({'action': 'display'}))
+        self.names = [dbus.service.BusName(name, self.bus, do_not_queue=True)
+                      for name in (NM, MM, BLUEZ, RADIOS, SCREEN)]
+        GLib.timeout_add_seconds(3, self.poll)
+
+    def authorize(self, sender):
+        if sender is None or self.bus.get_unix_user(sender) not in (0, 60000):
+            raise error('Only the local Ubuntu desktop may control radios', 'PermissionDenied')
+
+    def control(self, request):
+        """Fire-and-forget Android request for property setters."""
+        self.request(request, fail=lambda exc: print('Android request failed:', request.get('action'),
+                                                      getattr(exc, 'get_dbus_message', lambda: exc)(), flush=True))
+
+    def request(self, request, done=None, fail=None):
+        future = self.pool.submit(android, request)
+        def completed(result):
+            try:
+                value = result.result()
+                if 'accepted' in value and not value['accepted']:
+                    raise error('Android did not accept operation', 'Failed')
+            except Exception as exc:
+                if fail: GLib.idle_add(lambda e=exc: (fail(e), False)[1])
+            else:
+                if done: GLib.idle_add(lambda: (done(value), False)[1])
+            GLib.idle_add(lambda: (self.poll(), False)[1])
+        future.add_done_callback(completed)
+
+    def poll(self):
+        if self.polling: return True
+        self.polling = True
+        future = self.pool.submit(android, {'action':'snapshot'})
+        def completed(future):
+            def apply():
+                self.polling = False
+                try: self.refresh(future.result())
+                except Exception:
+                    # Do not show stale connected state when the agent is unavailable.
+                    self.device.update(DEVICE, {'State': U(20)})
+                    self.root.update(NM, {'State': U(10), 'Connectivity': U(0)})
+                return False
+            GLib.idle_add(apply)
+        future.add_done_callback(completed)
+        return True
+
+    def connect(self, request, profile, done, fail):
+        def accepted(result):
+            self.clear_active()
+            self.active_profile = profile
+            self.pending = profile.profile['ssid']
+            self.activation_started = time.monotonic()
+            self.set_active(profile, 1)
+            done(O(self.active_path))
+        self.request(request, accepted, fail)
+
+    def add_activate(self, settings, device, done, fail):
+        try:
+            if str(device) != DEV: raise error('Unknown device')
+            if settings.get('connection', {}).get('type', '802-11-wireless') != '802-11-wireless':
+                raise error('Only Wi-Fi infrastructure connections are supported')
+            wireless = settings.get('802-11-wireless', {})
+            if wireless.get('mode', 'infrastructure') != 'infrastructure' or wireless.get('hidden', False):
+                raise error('Hotspot, ad-hoc and hidden networks are not supported yet')
+            for family in ('ipv4', 'ipv6'):
+                if settings.get(family, {}).get('method', 'auto') != 'auto':
+                    raise error('IP configuration is managed by Android')
+            ssid = bytes(wireless['ssid']).decode('utf-8')
+            security = settings.get('802-11-wireless-security', {})
+            key = str(security.get('key-mgmt', 'none'))
+            if key not in ('none', 'wpa-psk', 'sae'): raise error('This Wi-Fi security type is not supported yet')
+            # Build a minimal profile, deliberately excluding any supplied password.
+            cleaned = {'connection': {'id': S(ssid), 'uuid': S(str(uuid.uuid4())), 'type': S('802-11-wireless')},
+                       '802-11-wireless': {'ssid': dbus.ByteArray(ssid.encode()), 'mode': S('infrastructure')},
+                       'ipv4': {'method': S('auto')}, 'ipv6': {'method': S('auto')}}
+            if key != 'none': cleaned['802-11-wireless-security'] = {'key-mgmt': S(key), 'psk-flags': U(1)}
+            profile = PendingProfile(self, cleaned)
+            request = {'action':'connect', 'ssid':ssid, 'security': {'none':'open','wpa-psk':'wpa2','sae':'wpa3'}[key]}
+            def failed(exc):
+                if profile.path in self.objects: profile.remove()
+                fail(exc)
+            def start(password=''):
+                if password: request['password'] = str(password)
+                self.connect(request, profile, lambda ac: done(O(profile.path), ac), failed)
+            if key == 'none' or security.get('psk'):
+                start(security.get('psk', ''))
+                return
+            agents = list(self.agent.agents.items())
+            if not agents:
+                failed(error('No desktop password agent is registered', 'AgentManager.NoSecrets'))
+                return
+            def try_agent(index=0):
+                if index >= len(agents):
+                    failed(error('No Wi-Fi password was provided', 'AgentManager.NoSecrets'))
+                    return
+                sender, agent = agents[index]
+                def secrets_received(secrets):
+                    password = secrets.get('802-11-wireless-security', {}).get('psk')
+                    if password: start(password)
+                    else: failed(error('Password was not provided', 'AgentManager.NoSecrets'))
+                def agent_failed(exc):
+                    if exc.get_dbus_name().endswith('UserCanceled'): failed(error('Connection canceled', 'AgentManager.UserCanceled'))
+                    else:
+                        self.agent.agents.pop(sender, None)
+                        try_agent(index+1)
+                agent.GetSecrets(cleaned, O(profile.path), '802-11-wireless-security', dbus.Array([],signature='s'), U(5),
+                                 dbus_interface=NM+'.SecretAgent', reply_handler=secrets_received, error_handler=agent_failed, timeout=120)
+            try_agent()
+        except Exception as exc: fail(exc)
+
+    def set_active(self, profile, state):
+        if self.active_path == '/':
+            self.active_path = BASE + '/ActiveConnection/1'
+            settings = profile.settings()['connection']
+            Object(self, self.active_path, {ACTIVE: {
+                'Connection': O(profile.path), 'SpecificObject': O('/'), 'Id': settings['id'],
+                'Uuid': settings['uuid'], 'Type': S('802-11-wireless'), 'Devices': paths([DEV]),
+                'State': U(state), 'StateFlags': U(0), 'Default': B(False), 'Default6': B(False),
+                'Ip4Config': O('/'), 'Ip6Config': O('/'), 'Dhcp4Config': O('/'), 'Dhcp6Config': O('/'),
+                'Vpn': B(False), 'Master': O('/'),
+            }})
+        self.objects[self.active_path].update(ACTIVE, {'State': U(state)})
+        self.device.update(DEVICE, {'ActiveConnection': O(self.active_path)})
+        self.update_root()
+
+    def clear_active(self):
+        if self.active_path != '/':
+            self.objects[self.active_path].update(ACTIVE, {'State': U(4)})
+            self.objects[self.active_path].remove()
+        self.active_path, self.active_profile = '/', None
+        self.pending = None
+        self.device.update(DEVICE, {'ActiveConnection': O('/')})
+        self.update_root()
+
+    def update_root(self):
+        """Active and primary connections across Wi-Fi and mobile data. Wi-Fi
+        is primary while connected, as on Android."""
+        wifi_state = 0
+        if self.active_path != '/':
+            wifi_state = int(self.objects[self.active_path].interfaces[ACTIVE]['State'])
+        active = [self.active_path] if self.active_path != '/' else []
+        if self.mobile_active:
+            active.append(MOBILE_ACTIVE)
+        if wifi_state == 2:
+            primary, kind = self.active_path, '802-11-wireless'
+        elif self.mobile_active:
+            primary, kind = MOBILE_ACTIVE, 'gsm'
+        else:
+            primary, kind = '/', ''
+        self.root.update(NM, {'ActiveConnections': paths(active), 'PrimaryConnection': O(primary),
+                              'PrimaryConnectionType': S(kind),
+                              'ActivatingConnection': O(self.active_path if wifi_state == 1 else '/')})
+        for path in active:
+            self.objects[path].update(ACTIVE, {'Default': B(path == primary)})
+
+    def refresh_mobile(self, data):
+        mobile = data.get('mobile', {})
+        cellular = [n for n in data['networks'] if n.get('cellular') and not n.get('vpn') and n.get('internet')]
+        sim_ready = bool(mobile.get('simReady'))
+        data_enabled = bool(mobile.get('dataEnabled'))
+        connected = sim_ready and data_enabled and bool(cellular)
+        interface = next((n['interface'] for n in cellular if n.get('validated')),
+                         cellular[0]['interface'] if cellular else 'rmnet')
+        operator = mobile.get('operatorName') or ''
+        self.mobile_profile.name = operator or '移动数据'
+
+        if connected and not self.mobile_active:
+            settings = self.mobile_profile.settings()['connection']
+            self.mobile_active = Object(self, MOBILE_ACTIVE, {ACTIVE: {
+                'Connection': O(MOBILE_PROFILE), 'SpecificObject': O('/'), 'Id': settings['id'],
+                'Uuid': settings['uuid'], 'Type': S('gsm'), 'Devices': paths([MODEM_DEV]),
+                'State': U(2), 'StateFlags': U(0), 'Default': B(False), 'Default6': B(False),
+                'Ip4Config': O('/'), 'Ip6Config': O('/'), 'Dhcp4Config': O('/'), 'Dhcp6Config': O('/'),
+                'Vpn': B(False), 'Master': O('/'),
+            }})
+        elif not connected and self.mobile_active:
+            self.mobile_active.update(ACTIVE, {'State': U(4)})
+            self.mobile_active.remove()
+            self.mobile_active = None
+        if self.mobile_active:
+            self.mobile_active.update(ACTIVE, {'Id': S(self.mobile_profile.name)})
+
+        state = 100 if connected else (30 if sim_ready and data_enabled else 20)
+        previous = int(self.modem_device.interfaces[DEVICE]['State'])
+        self.modem_device.update(DEVICE, {'State': U(state), 'StateReason': dbus.Struct((U(state), U(0))),
+                                          'Interface': S(interface), 'IpInterface': S(interface if connected else ''),
+                                          'ActiveConnection': O(MOBILE_ACTIVE if connected else '/')})
+        self.modem_device.update(NM_MODEM, {'OperatorCode': S(mobile.get('operatorCode') or '')})
+        if state != previous:
+            self.modem_device.StateChanged(U(state), U(previous), U(0))
+        self.root.update(NM, {'WwanEnabled': B(data_enabled), 'WwanHardwareEnabled': B(sim_ready)})
+
+        level = max(0, min(4, int(mobile.get('signalLevel') or 0)))
+        registered = sim_ready and bool(operator)
+        self.modem.update(MM_MODEM, {
+            'State': dbus.Int32(11 if connected else (8 if registered else 3)),
+            'AccessTechnologies': U(ACCESS_TECHNOLOGIES.get(int(mobile.get('networkType') or 0), 0)),
+            'SignalQuality': dbus.Struct((U(level * 25), B(sim_ready)), signature='ub'),
+        })
+        self.modem.update(MM_3GPP, {'OperatorName': S(operator), 'OperatorCode': S(mobile.get('operatorCode') or ''),
+                                    'RegistrationState': U(1 if registered else 0)})
+
+    def refresh_bluetooth(self, data):
+        bt = data.get('bluetooth', {})
+        state = int(bt.get('state', 10))   # Android: 10 off, 11 turning on, 12 on, 13 turning off
+        name = bt.get('name') or 'Android'
+        self.adapter.update(ADAPTER, {
+            'Address': S(bt.get('address') or '00:00:00:00:00:00'), 'Name': S(name), 'Alias': S(name),
+            'Powered': B(state == 12),
+            'PowerState': S({11: 'off-enabling', 12: 'on', 13: 'on-disabling'}.get(state, 'off')),
+        })
+        seen = set()
+        for entry in bt.get('devices', []):
+            path = bluetooth_path(entry['address'])
+            device = self.bt_devices.get(path)
+            if device is None:
+                device = self.bt_devices[path] = BluetoothDevice(self, entry['address'])
+            device.refresh(entry)
+            seen.add(path)
+        for path in list(self.bt_devices):
+            if path not in seen:
+                self.bt_devices.pop(path).remove()
+
+    def refresh(self, data):
+        self.snapshot = data
+        enabled, current = data['wifiEnabled'], data['current']
+        seen = set()
+        for ap in data['accessPoints']:
+            if not ap.get('ssid') or not ap.get('bssid'): continue
+            obj = next((o for o in self.aps.values() if o.ap['bssid'] == ap['bssid']), None)
+            if obj is None:
+                obj = AccessPoint(self, ap)
+                self.aps[obj.path] = obj
+                self.device.AccessPointAdded(O(obj.path))
+            else: obj.refresh(ap)
+            seen.add(obj.path)
+        for path in list(self.aps):
+            if path not in seen:
+                self.device.AccessPointRemoved(O(path))
+                self.aps.pop(path).remove()
+        existing = set()
+        for p in data['profiles']:
+            path = BASE + '/Settings/' + str(p['networkId'] + 1)
+            if path not in self.profiles:
+                self.profiles[path] = Profile(self, p)
+                self.settings.NewConnection(O(path))
+            else: self.profiles[path].profile = p
+            existing.add(path)
+        for path in list(self.profiles):
+            if path not in existing: self.profiles.pop(path).remove()
+        self.settings.update(SETTINGS, {'Connections': paths(self.profiles)})
+        connected = enabled and current.get('state') == 'COMPLETED' and current.get('networkId', -1) >= 0
+        target_connected = connected and (not self.pending or current.get('ssid') == self.pending)
+        activating = self.pending is not None and time.monotonic() - self.activation_started < 45 and not target_connected
+        if activating: connected = False
+        state = 100 if connected else (40 if activating else (30 if enabled else 20))
+        previous = int(self.device.interfaces[DEVICE]['State'])
+        if connected:
+            p = next((p for p in self.profiles.values() if p.profile['networkId'] == current['networkId']), None)
+            if p:
+                if self.active_profile and self.active_profile.path != p.path: self.clear_active()
+                self.active_profile = p
+                self.pending = None
+                self.set_active(p, 2)
+        elif not activating: self.clear_active()
+        self.device.update(DEVICE, {'State': U(state), 'StateReason': dbus.Struct((U(state), U(0))),
+                                    'AvailableConnections': paths(self.profiles)})
+        if state != previous: self.device.StateChanged(U(state), U(previous), U(0))
+        active_ap = next((o.path for o in self.aps.values() if o.ap['bssid'] == current.get('bssid')), '/')
+        self.device.update(WIRE, {'AccessPoints': paths(self.aps), 'ActiveAccessPoint': O(active_ap if connected else '/'),
+                                  'Bitrate': U(max(0, current.get('linkSpeed', 0)) * 1000),
+                                  'LastScan': dbus.Int64(max((ap.get('timestamp', 0) // 1000 for ap in data['accessPoints']), default=-1))})
+        self.refresh_mobile(data)
+        self.refresh_bluetooth(data)
+        self.radios.update(RADIOS, {'AirplaneMode': B(bool(data.get('airplane')))})
+        self.update_root()
+        validated = any(n['validated'] for n in data['networks'])
+        connected = connected or self.mobile_active is not None
+        global_state = 70 if validated else (50 if connected else (40 if activating else 20))
+        old_global = self.root.interfaces[NM]['State']
+        self.root.update(NM, {'WirelessEnabled': B(enabled), 'State': U(global_state), 'Connectivity': U(4 if validated else 1)})
+        if old_global != global_state: self.root.StateChanged(U(global_state))
+
+if __name__ == '__main__':
+    DBusGMainLoop(set_as_default=True)
+    agent_process = None
+    try:
+        try: android({'action':'snapshot'})
+        except (OSError, ValueError):
+            def android_root():
+                rootfd = os.open('/proc/1/root', os.O_RDONLY | os.O_DIRECTORY)
+                with open('/proc/1/ns/mnt', 'rb') as namespace:
+                    os.setns(namespace.fileno(), 0)
+                os.fchdir(rootfd)
+                os.chroot('.')
+                os.close(rootfd)
+                os.chdir('/')
+            android_env = {'CLASSPATH':'/data/local/ubuntu26/bridge/native-network-agent.jar', 'PATH':'/system/bin',
+                           'ANDROID_DATA':'/data', 'ANDROID_ROOT':'/system'}
+            # ART needs the boot class path configured by Android init. Import only
+            # runtime paths from zygote, never arbitrary desktop or secret variables.
+            for proc in pathlib.Path('/proc').iterdir():
+                if not proc.name.isdigit(): continue
+                try:
+                    with (proc/'cmdline').open('rb') as command:
+                        if command.read(16).split(b'\0',1)[0] != b'zygote64': continue
+                    for entry in (proc/'environ').read_bytes().split(b'\0'):
+                        key, separator, value = entry.partition(b'=')
+                        name = key.decode(errors='replace')
+                        if separator and (name.startswith('ANDROID_') or name in ('BOOTCLASSPATH','DEX2OATBOOTCLASSPATH','SYSTEMSERVERCLASSPATH')):
+                            if not name.startswith('ANDROID_SOCKET_'): android_env[name] = value.decode()
+                    break
+                except OSError: continue
+            if 'BOOTCLASSPATH' not in android_env:
+                raise RuntimeError('Android zygote runtime environment was not found')
+            agent_process = subprocess.Popen(['/system/bin/app_process', '/system/bin', 'local.ubuntu26.connectivity.NetAgent'],
+                env=android_env, preexec_fn=android_root, stdin=subprocess.DEVNULL,
+                stdout=None, stderr=None)
+            for attempt in range(40):
+                try:
+                    android({'action':'snapshot'})
+                    break
+                except (OSError, ValueError): time.sleep(.2)
+            else: raise RuntimeError('Android connectivity agent did not start; exit=' + str(agent_process.poll()))
+        service = Service()
+        loop = GLib.MainLoop()
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, lambda: (loop.quit(), False)[1])
+        loop.run()
+    finally:
+        if agent_process:
+            agent_process.terminate()
+            try: agent_process.wait(timeout=5)
+            except subprocess.TimeoutExpired: agent_process.kill()

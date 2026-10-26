@@ -1,0 +1,204 @@
+--- a/src/backends/anland/meta-backend-anland.c
++++ b/src/backends/anland/meta-backend-anland.c
+@@ -23,16 +23,23 @@
+ #include "wayland/meta-wayland.h"
+ 
+ #include <drm_fourcc.h>
++#include <errno.h>
+ #include <fcntl.h>
++#include <linux/sync_file.h>
+ #include <math.h>
+ #include <string.h>
+ #include <sys/eventfd.h>
++#include <sys/ioctl.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
++#include <xf86drm.h>
+ 
+ #define ANLAND_RECONNECT_INTERVAL_MS 200
+ #define ANLAND_PROTOCOL_FORMAT_RGBA_8888 1
+ #define ANLAND_MAX_RESOURCE_FDS 64
++/* The panel's DRM device; its vblank timestamps are readable without being
++ * DRM master. */
++#define ANLAND_VBLANK_DEVICE "/dev/dri/card0"
+ 
+ enum
+ {
+@@ -69,6 +76,13 @@
+   int64_t pending_view_frame_counter;
+   unsigned int presentation_sequence;
+ 
++  /* Frame timing for the frame clock: the panel's vblanks, and when the
++   * pending frame was submitted and finished rendering. Without vblank
++   * timestamps the frame clock free-runs out of phase with the panel. */
++  int vblank_fd;
++  int pending_fence_fd;
++  int64_t pending_submit_time_us;
++
+   /* The consumer hands buffers back in its own order, so each one carries
+    * an older frame. Tracking when each was last painted gives the stage a
+    * buffer age, and it repairs only the damage that buffer missed. */
+@@ -517,22 +531,110 @@
+ }
+ 
+ static void
++clear_pending_fence (MetaBackendAnland *backend)
++{
++  if (backend->pending_fence_fd >= 0)
++    close (backend->pending_fence_fd);
++  backend->pending_fence_fd = -1;
++}
++
++/* When the render fence signaled, or 0 if it has not yet. */
++static int64_t
++get_fence_signal_time_us (int fence_fd)
++{
++  struct sync_fence_info fences[8];
++  struct sync_file_info info = { 0 };
++  int64_t signal_time_ns = 0;
++
++  if (ioctl (fence_fd, SYNC_IOC_FILE_INFO, &info) < 0 ||
++      info.status != 1 || info.num_fences == 0)
++    return 0;
++
++  info = (struct sync_file_info) {
++    .num_fences = MIN (info.num_fences, G_N_ELEMENTS (fences)),
++    .sync_fence_info = (uintptr_t) fences,
++  };
++  if (ioctl (fence_fd, SYNC_IOC_FILE_INFO, &info) < 0)
++    return 0;
++
++  for (uint32_t i = 0; i < info.num_fences; i++)
++    signal_time_ns = MAX (signal_time_ns, (int64_t) fences[i].timestamp_ns);
++
++  return signal_time_ns / 1000;
++}
++
++/* The first panel vblank at or after `ready_time_us`. */
++static gboolean
++get_vblank_after (MetaBackendAnland *backend,
++                  int64_t            ready_time_us,
++                  float              refresh_rate,
++                  int64_t           *vblank_time_us)
++{
++  drmVBlank vblank = {
++    .request.type = DRM_VBLANK_RELATIVE,
++    .request.sequence = 0,
++  };
++  int64_t interval_us;
++  int64_t time_us;
++
++  if (backend->vblank_fd < 0 || refresh_rate <= 0.0f ||
++      drmWaitVBlank (backend->vblank_fd, &vblank) != 0)
++    return FALSE;
++
++  interval_us = (int64_t) (G_USEC_PER_SEC / refresh_rate);
++  time_us = vblank.reply.tval_sec * G_USEC_PER_SEC + vblank.reply.tval_usec;
++  if (time_us < ready_time_us)
++    time_us += (ready_time_us - time_us + interval_us - 1) / interval_us * interval_us;
++
++  *vblank_time_us = time_us;
++  return TRUE;
++}
++
++static void
+ complete_pending_frame (MetaBackendAnland *backend)
+ {
+   ClutterFrameInfo frame_info;
++  int64_t now_us = g_get_monotonic_time ();
++  int64_t ready_time_us;
++  int64_t vblank_time_us;
++  float refresh_rate;
+ 
+   if (!backend->stage_view || !backend->frame_pending)
+     return;
+ 
++  /* The frame can be shown once it is submitted and rendered; a fence that
++   * has not signaled yet makes "now" the best lower bound. */
++  ready_time_us = now_us;
++  if (backend->pending_fence_fd >= 0)
++    {
++      int64_t signal_time_us = get_fence_signal_time_us (backend->pending_fence_fd);
++
++      if (signal_time_us > 0)
++        ready_time_us = MAX (signal_time_us, backend->pending_submit_time_us);
++    }
++  clear_pending_fence (backend);
++
++  refresh_rate = clutter_stage_view_get_refresh_rate (
++    CLUTTER_STAGE_VIEW (backend->stage_view));
+   frame_info = (ClutterFrameInfo) {
+     .global_frame_counter = backend->pending_global_frame_counter,
+     .view_frame_counter = backend->pending_view_frame_counter,
+-    .refresh_rate = clutter_stage_view_get_refresh_rate (
+-      CLUTTER_STAGE_VIEW (backend->stage_view)),
+-    .presentation_time = g_get_monotonic_time (),
++    .refresh_rate = refresh_rate,
++    .presentation_time = now_us,
+     .flags = CLUTTER_FRAME_INFO_FLAG_NONE,
+     .sequence = ++backend->presentation_sequence,
+   };
++
++  /* Reporting the panel's vblank lets the frame clock schedule updates in
++   * phase with it, instead of on a free-running timer. */
++  if (get_vblank_after (backend, ready_time_us, refresh_rate, &vblank_time_us))
++    {
++      frame_info.presentation_time = vblank_time_us;
++      frame_info.flags = CLUTTER_FRAME_INFO_FLAG_VSYNC |
++                         CLUTTER_FRAME_INFO_FLAG_HW_CLOCK;
++      frame_info.kms_ready_time_us = ready_time_us;
++    }
++
+   clutter_stage_view_notify_presented (CLUTTER_STAGE_VIEW (backend->stage_view),
+                                        &frame_info);
+   backend->frame_pending = FALSE;
+@@ -583,6 +685,7 @@
+   backend->consumer_active = FALSE;
+   backend->current_buffer = -1;
+   backend->frame_pending = FALSE;
++  clear_pending_fence (backend);
+   reset_buffer_ages (backend);
+   inhibit_frame_clock (backend);
+ }
+@@ -618,9 +721,17 @@
+       cogl_framebuffer_finish (framebuffer);
+     }
+ 
++  /* The transport takes the fence; keep a copy to learn when rendering
++   * finished. */
++  clear_pending_fence (backend);
++  if (fence_fd >= 0)
++    backend->pending_fence_fd = fcntl (fence_fd, F_DUPFD_CLOEXEC, 3);
++  backend->pending_submit_time_us = g_get_monotonic_time ();
++
+   meta_anland_transport_set_render_fence (backend->transport, fence_fd);
+   if (!meta_anland_transport_notify_frame_done (backend->transport))
+     {
++      clear_pending_fence (backend);
+       /* The stage already stepped its damage history for this paint. */
+       reset_buffer_ages (backend);
+       clutter_frame_set_result (frame, CLUTTER_FRAME_RESULT_IDLE);
+@@ -1063,6 +1174,10 @@
+   g_clear_handle_id (&backend->reconnect_source_id, g_source_remove);
+   clear_transport (backend);
+   uninhibit_frame_clock (backend);
++  clear_pending_fence (backend);
++  if (backend->vblank_fd >= 0)
++    close (backend->vblank_fd);
++  backend->vblank_fd = -1;
+   g_clear_pointer (&backend->audio, meta_anland_audio_free);
+   g_clear_pointer (&backend->camera, meta_anland_camera_free);
+   g_clear_pointer (&backend->clipboard, meta_anland_clipboard_free);
+@@ -1099,6 +1214,12 @@
+ {
+   backend_anland->socket_path = get_default_socket_path ();
+   backend_anland->current_buffer = -1;
++  backend_anland->pending_fence_fd = -1;
++
++  backend_anland->vblank_fd = open (ANLAND_VBLANK_DEVICE, O_RDWR | O_CLOEXEC);
++  if (backend_anland->vblank_fd < 0)
++    g_message ("Anland: no panel vblank timestamps (%s: %s); frame timing "
++               "will not follow the panel", ANLAND_VBLANK_DEVICE, g_strerror (errno));
+ }
+ 
+ gboolean

@@ -1,0 +1,56 @@
+#!/bin/bash
+set -euo pipefail
+install -d -m 0700 -o 60000 -g 60000 /run/user/60000
+install -d -m 1777 /tmp/.X11-unix
+test -S /tmp/anland/display_daemon.sock
+chmod 0711 /tmp/anland
+chmod 0666 /tmp/anland/display_daemon.sock
+install -d -m 0755 -o 60000 -g 60000 /home/ubuntu/.local /home/ubuntu/.local/state /home/ubuntu/.local/state/anland
+
+# /run belongs only to this GNOME mount namespace, not Android or SSH.
+install -d -m 0755 /run/dbus
+dbus-uuidgen --ensure=/etc/machine-id
+# Ubuntu's own disk, for UDisks (D-Bus activated once the bus is up).
+/usr/local/libexec/ubuntu26-system-disk || true
+bus_pid=$(dbus-daemon --system --fork --nopidfile --print-pid=1)
+export DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket
+session_pid=
+native_network_pid=
+cleanup() {
+    [[ -z $session_pid ]] || kill -TERM "$session_pid" 2>/dev/null || true
+    [[ -z $native_network_pid ]] || kill -TERM "$native_network_pid" 2>/dev/null || true
+    kill -TERM "$bus_pid" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+
+# Standard D-Bus activation works without systemd as PID 1. Record optional
+# service failures without making a usable desktop depend on them.
+{
+    timeout 15 gdbus call --system --dest org.freedesktop.PolicyKit1 \
+        --object-path /org/freedesktop/PolicyKit1/Authority \
+        --method org.freedesktop.DBus.Properties.Get \
+        org.freedesktop.PolicyKit1.Authority BackendName || true
+    timeout 15 gdbus call --system --dest org.freedesktop.UPower \
+        --object-path /org/freedesktop/UPower \
+        --method org.freedesktop.UPower.EnumerateDevices || true
+    timeout 15 gdbus call --system --dest org.freedesktop.UDisks2 \
+        --object-path /org/freedesktop/UDisks2/Manager \
+        --method org.freedesktop.DBus.Properties.Get \
+        org.freedesktop.UDisks2.Manager Version || true
+} > /home/ubuntu/.local/state/anland/system-services.log 2>&1
+
+/usr/bin/python3 /usr/local/libexec/ubuntu26-native-network \
+    > /home/ubuntu/.local/state/anland/native-network.log 2>&1 &
+native_network_pid=$!
+
+cd /home/ubuntu
+runuser -u none -- env HOME=/home/ubuntu USER=none LOGNAME=none \
+    LANG=zh_CN.UTF-8 LANGUAGE=zh_CN:zh XMODIFIERS=@im=ibus QT_IM_MODULE=ibus \
+    DBUS_SYSTEM_BUS_ADDRESS="$DBUS_SYSTEM_BUS_ADDRESS" \
+    XDG_RUNTIME_DIR=/run/user/60000 ANLAND_LOG_DIR=/home/ubuntu/.local/state/anland \
+    ANLAND_GNOME_DEBUG=1 ANLAND_SOCKET=/tmp/anland/display_daemon.sock \
+    /usr/local/bin/startgnome-anland &
+session_pid=$!
+wait "$session_pid"

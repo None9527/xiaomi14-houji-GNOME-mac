@@ -1,0 +1,32 @@
+#!/bin/bash
+# Presents the disk Ubuntu runs from to UDisks as a fixed system disk, so GNOME
+# (Settings > About, Disks, Files) sees Ubuntu's own storage. The root
+# filesystem is a loop-mounted image and this chroot has no udev, so the
+# device node and its udev record are created here. Only this one device is
+# exposed; the phone's partitions stay out of the desktop's reach.
+set -eu
+
+devnum=$(awk '$5 == "/" { print $3; exit }' /proc/self/mountinfo)
+name=$(sed -n 's/^DEVNAME=//p' "/sys/dev/block/$devnum/uevent")
+[ -n "$name" ] || exit 0
+
+[ -b "/dev/$name" ] || mknod -m 0660 "/dev/$name" b "${devnum%:*}" "${devnum#*:}"
+chgrp disk "/dev/$name"
+
+eval "$(blkid -o export "/dev/$name" | grep -E '^(TYPE|UUID)=')"
+mkdir -p /run/udev/data
+cat > "/run/udev/data/b$devnum" <<EOF
+I:1
+E:ID_SERIAL=Ubuntu26_System_Disk
+E:ID_SERIAL_SHORT=ubuntu26
+E:ID_VENDOR=Ubuntu
+E:ID_MODEL=System_Disk
+E:ID_MODEL_ENC=系统盘
+E:ID_FS_TYPE=${TYPE:-}
+E:ID_FS_USAGE=filesystem
+E:ID_FS_UUID=${UUID:-}
+E:ID_FS_UUID_ENC=${UUID:-}
+E:UDISKS_SYSTEM=1
+E:UDISKS_NAME=Ubuntu 系统盘
+E:UDISKS_ICON_NAME=drive-harddisk
+EOF

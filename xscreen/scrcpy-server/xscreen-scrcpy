@@ -1,0 +1,56 @@
+#!/bin/sh
+# Shows the phone's GNOME desktop in the stock scrcpy client (4.0 or newer)
+# as an extra monitor, instead of mirroring the phone.
+#
+#   xscreen-scrcpy [WIDTHxHEIGHT] [scrcpy options...]
+#
+# The keyboard goes in as a HID device, so GNOME's own input method and
+# layout apply. The mouse uses absolute positions: the Mac's own pointer
+# moves without delay and GNOME's follows it. With --mouse=uhid (captured,
+# relative motion) GNOME's pointer is drawn into the picture instead.
+if ! command -v scrcpy >/dev/null 2>&1; then
+  echo "xscreen-scrcpy: scrcpy is not installed (brew install scrcpy)" >&2
+  exit 1
+fi
+here=$(cd "$(dirname "$0")" && pwd)
+size=1920x1080
+case "$1" in
+  *[0-9]x[0-9]*) size=$1; shift ;;
+esac
+
+# The desktop serves one client at a time: XScreen steps aside while scrcpy
+# runs and comes back afterwards.
+xscreen_app=
+if pgrep -x XScreen >/dev/null 2>&1; then
+  xscreen_app=$(ps -o comm= -p "$(pgrep -x XScreen | head -1)" | sed 's|/Contents/MacOS/XScreen$||')
+  osascript -e 'quit app "XScreen"' >/dev/null 2>&1 || pkill -x XScreen
+  while pgrep -x XScreen >/dev/null 2>&1; do sleep 0.2; done
+  sleep 1      # let xscreend notice the disconnect
+fi
+
+# A Mac input method would take the keys before scrcpy sees them; the
+# guard keeps a plain layout selected while the window is in front.
+guard="$here/xscreen-ime-guard"
+if [ "$here/ime-guard.swift" -nt "$guard" ] && command -v swiftc >/dev/null 2>&1; then
+  swiftc -O -o "$guard" "$here/ime-guard.swift" || rm -f "$guard"
+fi
+guard_pid=
+if [ -x "$guard" ]; then
+  "$guard" $$ &
+  guard_pid=$!
+fi
+
+case " $* " in
+  *" --mouse=uhid "*|*" -M "*) set -- --show-touches "$@" ;;
+esac
+
+SCRCPY_SERVER_PATH="$here/xscreen-scrcpy-server" \
+  scrcpy --new-display="$size" --keyboard=uhid --mouse=sdk --no-audio \
+    --window-title="GNOME" "$@"
+status=$?
+[ -z "$guard_pid" ] || kill "$guard_pid" 2>/dev/null
+
+if [ -n "$xscreen_app" ]; then
+  open "$xscreen_app"
+fi
+exit $status

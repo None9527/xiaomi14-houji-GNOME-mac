@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=ZCode
+Comment=ZCode, rasterizing on the CPU: GPU rasterization garbles text on this GPU driver
+Exec=/opt/ZCode/zcode --disable-gpu-rasterization %U
+Terminal=false
+Type=Application
+Icon=zcode
+StartupWMClass=ZCode
+MimeType=x-scheme-handler/zcode;
+Categories=Development;

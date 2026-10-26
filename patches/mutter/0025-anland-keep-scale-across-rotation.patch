@@ -1,0 +1,69 @@
+--- a/src/backends/anland/meta-backend-anland.c
++++ b/src/backends/anland/meta-backend-anland.c
+@@ -11,7 +11,10 @@
+ #include "backends/anland/vendor/meta-anland-transport.h"
+ #include "backends/meta-backend-private.h"
+ #include "backends/meta-fd-source.h"
++#include "backends/meta-logical-monitor-private.h"
++#include "backends/meta-monitor-private.h"
+ #include "backends/meta-monitor-manager-private.h"
++#include "backends/meta-output.h"
+ #include "backends/meta-renderer.h"
+ #include "backends/meta-renderer-view.h"
+ #include "backends/meta-stage-view-private.h"
+@@ -345,6 +348,28 @@
+ 
+   backend->screen_info = screen_info;
+   return TRUE;
++}
++
++/* The scale for the panel's mode: the one in use when the panel already
++ * shows something (it rotated, so keep what the user sees), otherwise one
++ * that keeps the short side near 600 logical pixels, as phones do. */
++static float
++get_preferred_scale (MetaBackendAnland *backend)
++{
++  int short_side = MIN (backend->screen_info.width, backend->screen_info.height);
++
++  if (backend->virtual_monitor)
++    {
++      MetaOutput *output = meta_virtual_monitor_get_output (backend->virtual_monitor);
++      MetaMonitor *monitor = output ? meta_output_get_monitor (output) : NULL;
++      MetaLogicalMonitor *logical_monitor =
++        monitor ? meta_monitor_get_logical_monitor (monitor) : NULL;
++
++      if (logical_monitor)
++        return meta_logical_monitor_get_scale (logical_monitor);
++    }
++
++  return CLAMP (roundf (short_side / 600.0f), 1.0f, 4.0f);
+ }
+ 
+ static gboolean
+@@ -352,6 +377,7 @@
+                         GError            **error)
+ {
+   MetaMonitorManager *monitor_manager;
++  MetaVirtualModeInfo *mode_info;
+   float refresh_rate;
+   g_autolist (MetaVirtualModeInfo) mode_infos = NULL;
+ 
+@@ -361,11 +387,13 @@
+   monitor_manager = meta_backend_get_monitor_manager (META_BACKEND (backend));
+   refresh_rate = backend->screen_info.refresh > 0 ?
+     backend->screen_info.refresh / 1000.0f : 60.0f;
+-  mode_infos = g_list_append (mode_infos,
+-                              meta_virtual_mode_info_new (
+-                                backend->screen_info.width,
+-                                backend->screen_info.height,
+-                                refresh_rate));
++  mode_info = meta_virtual_mode_info_new (backend->screen_info.width,
++                                          backend->screen_info.height,
++                                          refresh_rate);
++  /* A rotation changes the mode, so the stored configuration no longer
++   * applies; without a preferred scale the default would ignore it. */
++  meta_virtual_mode_info_set_preferred_scale (mode_info, get_preferred_scale (backend));
++  mode_infos = g_list_append (mode_infos, mode_info);
+ 
+   if (backend->virtual_monitor)
+     {

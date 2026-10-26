@@ -1,0 +1,91 @@
+#!/usr/bin/python3
+"""gnome-settings-daemon's rfkill interface, backed by the phone's radios.
+
+GNOME Shell and Settings switch Bluetooth and airplane mode through
+org.gnome.SettingsDaemon.Rfkill. gsd-rfkill drives the kernel's /dev/rfkill,
+which belongs to Android here, so this answers in its place: airplane mode is
+Android's, Bluetooth is the BlueZ adapter bridged by ubuntu26-native-network.
+"""
+import dbus
+import dbus.service
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+RFKILL = 'org.gnome.SettingsDaemon.Rfkill'
+RFKILL_PATH = '/org/gnome/SettingsDaemon/Rfkill'
+PROP = 'org.freedesktop.DBus.Properties'
+BLUEZ = 'org.bluez'
+ADAPTER = 'org.bluez.Adapter1'
+ADAPTER_PATH = '/org/bluez/hci0'
+RADIOS = 'local.ubuntu26.Radios'
+RADIOS_PATH = '/local/ubuntu26/Radios'
+
+class Rfkill(dbus.service.Object):
+    def __init__(self, session, system):
+        super().__init__(session, RFKILL_PATH)
+        self.system = system
+        self.props = {
+            'AirplaneMode': False, 'HasAirplaneMode': True, 'HardwareAirplaneMode': False,
+            'ShouldShowAirplaneMode': True, 'BluetoothAirplaneMode': True,
+            'BluetoothHasAirplaneMode': False, 'BluetoothHardwareAirplaneMode': False,
+        }
+        for path in (ADAPTER_PATH, RADIOS_PATH):
+            system.add_signal_receiver(lambda *_: self.reload(), 'PropertiesChanged', PROP, path=path)
+        for name in (BLUEZ, RADIOS):
+            system.add_signal_receiver(lambda *_: self.reload(), 'NameOwnerChanged',
+                                       'org.freedesktop.DBus', arg0=name)
+        self.reload()
+
+    def remote_get(self, name, path, iface, key):
+        try:
+            return self.system.get_object(name, path, introspect=False).Get(iface, key, dbus_interface=PROP)
+        except dbus.DBusException:
+            return None
+
+    def remote_set(self, name, path, iface, key, value):
+        self.system.get_object(name, path, introspect=False).Set(
+            iface, key, dbus.Boolean(value), dbus_interface=PROP)
+
+    def reload(self):
+        powered = self.remote_get(BLUEZ, ADAPTER_PATH, ADAPTER, 'Powered')
+        airplane = self.remote_get(RADIOS, RADIOS_PATH, RADIOS, 'AirplaneMode')
+        changed = {}
+        for key, value in (('AirplaneMode', bool(airplane)),
+                           ('BluetoothHasAirplaneMode', powered is not None),
+                           ('BluetoothAirplaneMode', powered is None or not powered)):
+            if self.props[key] != value:
+                self.props[key] = changed[key] = value
+        if changed:
+            self.PropertiesChanged(RFKILL, {k: dbus.Boolean(v) for k, v in changed.items()}, [])
+
+    @dbus.service.method(PROP, in_signature='s', out_signature='a{sv}')
+    def GetAll(self, iface):
+        if iface != RFKILL:
+            return {}
+        return {k: dbus.Boolean(v) for k, v in self.props.items()}
+
+    @dbus.service.method(PROP, in_signature='ss', out_signature='v')
+    def Get(self, iface, key):
+        if iface != RFKILL or key not in self.props:
+            raise dbus.DBusException('Unknown property', name='org.freedesktop.DBus.Error.UnknownProperty')
+        return dbus.Boolean(self.props[key])
+
+    @dbus.service.method(PROP, in_signature='ssv', out_signature='')
+    def Set(self, iface, key, value):
+        if iface == RFKILL and key == 'AirplaneMode':
+            self.remote_set(RADIOS, RADIOS_PATH, RADIOS, 'AirplaneMode', bool(value))
+        elif iface == RFKILL and key == 'BluetoothAirplaneMode':
+            self.remote_set(BLUEZ, ADAPTER_PATH, ADAPTER, 'Powered', not bool(value))
+        else:
+            raise dbus.DBusException('Property is not writable', name='org.freedesktop.DBus.Error.PropertyReadOnly')
+
+    @dbus.service.signal(PROP, signature='sa{sv}as')
+    def PropertiesChanged(self, iface, changed, invalidated):
+        pass
+
+if __name__ == '__main__':
+    DBusGMainLoop(set_as_default=True)
+    session = dbus.SessionBus()
+    service = Rfkill(session, dbus.SystemBus())
+    name = dbus.service.BusName(RFKILL, session, do_not_queue=True)
+    GLib.MainLoop().run()

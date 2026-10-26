@@ -1,0 +1,11 @@
+# Build outputs
+xscreen/mac/.build/
+xscreen/mac/build/
+xscreen/phone/build/
+# Rebuilt from ime-guard.swift by xscreen-scrcpy on first use
+xscreen/scrcpy-server/xscreen-ime-guard
+# Captures and logs from probing sessions
+xscreen/probe/out/
+
+.DS_Store
+__pycache__/

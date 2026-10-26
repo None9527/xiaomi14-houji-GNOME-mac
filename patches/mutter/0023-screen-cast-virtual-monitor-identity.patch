@@ -1,0 +1,196 @@
+diff --git a/src/backends/meta-screen-cast-session.c b/src/backends/meta-screen-cast-session.c
+index 3ab9662..5b58869 100644
+--- a/src/backends/meta-screen-cast-session.c
++++ b/src/backends/meta-screen-cast-session.c
+@@ -820,6 +820,9 @@ handle_record_virtual (MetaDBusScreenCastSession *skeleton,
+   gboolean is_platform;
+   g_autoptr (GVariant) modes_variant = NULL;
+   g_autolist (MetaVirtualModeInfo) mode_infos = NULL;
++  const char *monitor_vendor = NULL;
++  const char *monitor_product = NULL;
++  const char *monitor_serial = NULL;
+   MetaScreenCastFlag flags;
+   g_autoptr (GError) error = NULL;
+   MetaScreenCastVirtualStream *virtual_stream;
+@@ -852,6 +855,10 @@ handle_record_virtual (MetaDBusScreenCastSession *skeleton,
+   if (!g_variant_lookup (properties_variant, "is-platform", "b", &is_platform))
+     is_platform = FALSE;
+ 
++  g_variant_lookup (properties_variant, "monitor-vendor", "&s", &monitor_vendor);
++  g_variant_lookup (properties_variant, "monitor-product", "&s", &monitor_product);
++  g_variant_lookup (properties_variant, "monitor-serial", "&s", &monitor_serial);
++
+   modes_variant = g_variant_lookup_value (properties_variant,
+                                           "modes", G_VARIANT_TYPE ("aa{sv}"));
+ 
+@@ -890,6 +897,12 @@ handle_record_virtual (MetaDBusScreenCastSession *skeleton,
+       return TRUE;
+     }
+ 
++  if (monitor_vendor && monitor_product && monitor_serial)
++    meta_screen_cast_virtual_stream_set_monitor_identity (virtual_stream,
++                                                          monitor_vendor,
++                                                          monitor_product,
++                                                          monitor_serial);
++
+   stream = META_SCREEN_CAST_STREAM (virtual_stream);
+   stream_path = meta_screen_cast_stream_get_object_path (stream);
+ 
+diff --git a/src/backends/meta-screen-cast-virtual-stream-src.c b/src/backends/meta-screen-cast-virtual-stream-src.c
+index 4d70801..de47713 100644
+--- a/src/backends/meta-screen-cast-virtual-stream-src.c
++++ b/src/backends/meta-screen-cast-virtual-stream-src.c
+@@ -23,6 +23,7 @@
+ #include "config.h"
+ 
+ #include "backends/meta-screen-cast-virtual-stream-src.h"
++#include "backends/meta-screen-cast-virtual-stream.h"
+ 
+ #include <spa/param/video/format-utils.h>
+ #include <spa/buffer/meta.h>
+@@ -701,6 +702,28 @@ generate_next_virtual_monitor_serial (void)
+   return g_strdup_printf ("0x%.6x", ++virtual_monitor_src_seq);
+ }
+ 
++static MetaVirtualMonitorInfo *
++create_monitor_info (MetaScreenCastVirtualStreamSrc *virtual_src,
++                     GList                          *mode_infos)
++{
++  MetaScreenCastStreamSrc *src = META_SCREEN_CAST_STREAM_SRC (virtual_src);
++  MetaScreenCastVirtualStream *virtual_stream =
++    META_SCREEN_CAST_VIRTUAL_STREAM (meta_screen_cast_stream_src_get_stream (src));
++  const char *vendor, *product, *serial;
++  g_autofree char *generated_serial = NULL;
++
++  if (meta_screen_cast_virtual_stream_get_monitor_identity (virtual_stream,
++                                                            &vendor, &product,
++                                                            &serial))
++    return meta_virtual_monitor_info_new (vendor, product, serial, mode_infos);
++
++  generated_serial = generate_next_virtual_monitor_serial ();
++  return meta_virtual_monitor_info_new ("MetaVendor",
++                                        "Virtual remote monitor",
++                                        generated_serial,
++                                        mode_infos);
++}
++
+ static MetaVirtualMonitor *
+ create_virtual_monitor (MetaScreenCastVirtualStreamSrc  *virtual_src,
+                         struct spa_video_info_raw       *video_format,
+@@ -710,19 +733,13 @@ create_virtual_monitor (MetaScreenCastVirtualStreamSrc  *virtual_src,
+   MetaBackend *backend = backend_from_src (src);
+   MetaMonitorManager *monitor_manager =
+     meta_backend_get_monitor_manager (backend);
+-  g_autofree char *serial = NULL;
+   g_autolist (MetaVirtualModeInfo) mode_infos = NULL;
+   g_autoptr (MetaVirtualMonitorInfo) info = NULL;
+ 
+-  serial = generate_next_virtual_monitor_serial ();
+-
+   mode_infos = g_list_append (mode_infos, create_mode_info (virtual_src,
+                                                             video_format));
+ 
+-  info = meta_virtual_monitor_info_new ("MetaVendor",
+-                                        "Virtual remote monitor",
+-                                        serial,
+-                                        mode_infos);
++  info = create_monitor_info (virtual_src, mode_infos);
+   return meta_monitor_manager_create_virtual_monitor (monitor_manager,
+                                                       info,
+                                                       error);
+@@ -870,15 +887,10 @@ meta_screen_cast_virtual_stream_src_initable_init (GInitable     *initable,
+ 
+   if (virtual_src->mode_infos)
+     {
+-      g_autofree char *serial = NULL;
+       g_autoptr (MetaVirtualMonitorInfo) info = NULL;
+       MetaVirtualMonitor *virtual_monitor;
+ 
+-      serial = generate_next_virtual_monitor_serial ();
+-      info = meta_virtual_monitor_info_new ("MetaVendor",
+-                                            "Virtual remote monitor",
+-                                            serial,
+-                                            virtual_src->mode_infos);
++      info = create_monitor_info (virtual_src, virtual_src->mode_infos);
+       virtual_monitor =
+         meta_monitor_manager_create_virtual_monitor (monitor_manager,
+                                                      info,
+diff --git a/src/backends/meta-screen-cast-virtual-stream.c b/src/backends/meta-screen-cast-virtual-stream.c
+index 6acb21f..aafc095 100644
+--- a/src/backends/meta-screen-cast-virtual-stream.c
++++ b/src/backends/meta-screen-cast-virtual-stream.c
+@@ -30,6 +30,12 @@ struct _MetaScreenCastVirtualStream
+   MetaScreenCastStream parent;
+ 
+   GList *mode_infos;
++
++  /* Monitor identity chosen by the client, so the monitor configuration
++   * (position, mode, scale) is remembered across sessions. */
++  char *vendor;
++  char *product;
++  char *serial;
+ };
+ 
+ static void meta_eis_viewport_iface_init (MetaEisViewportInterface *eis_viewport_iface);
+@@ -67,6 +73,32 @@ meta_screen_cast_virtual_stream_new (MetaScreenCastSession     *session,
+   return virtual_stream;
+ }
+ 
++void
++meta_screen_cast_virtual_stream_set_monitor_identity (MetaScreenCastVirtualStream *virtual_stream,
++                                                      const char                  *vendor,
++                                                      const char                  *product,
++                                                      const char                  *serial)
++{
++  g_set_str (&virtual_stream->vendor, vendor);
++  g_set_str (&virtual_stream->product, product);
++  g_set_str (&virtual_stream->serial, serial);
++}
++
++gboolean
++meta_screen_cast_virtual_stream_get_monitor_identity (MetaScreenCastVirtualStream  *virtual_stream,
++                                                      const char                  **vendor,
++                                                      const char                  **product,
++                                                      const char                  **serial)
++{
++  if (!virtual_stream->vendor || !virtual_stream->product || !virtual_stream->serial)
++    return FALSE;
++
++  *vendor = virtual_stream->vendor;
++  *product = virtual_stream->product;
++  *serial = virtual_stream->serial;
++  return TRUE;
++}
++
+ static gboolean
+ meta_screen_cast_virtual_stream_is_standalone (MetaEisViewport *viewport)
+ {
+@@ -217,6 +249,9 @@ meta_screen_cast_virtual_stream_finalize (GObject *object)
+   MetaScreenCastVirtualStream *virtual_stream =
+     META_SCREEN_CAST_VIRTUAL_STREAM (object);
+ 
++  g_clear_pointer (&virtual_stream->vendor, g_free);
++  g_clear_pointer (&virtual_stream->product, g_free);
++  g_clear_pointer (&virtual_stream->serial, g_free);
+   g_clear_list (&virtual_stream->mode_infos,
+                 (GDestroyNotify) meta_virtual_mode_info_free);
+ 
+diff --git a/src/backends/meta-screen-cast-virtual-stream.h b/src/backends/meta-screen-cast-virtual-stream.h
+index 93985ca..ac63aa6 100644
+--- a/src/backends/meta-screen-cast-virtual-stream.h
++++ b/src/backends/meta-screen-cast-virtual-stream.h
+@@ -32,3 +32,14 @@ MetaScreenCastVirtualStream * meta_screen_cast_virtual_stream_new (MetaScreenCas
+                                                                    GList                     *mode_infos,
+                                                                    MetaScreenCastFlag         flags,
+                                                                    GError                   **error);
++
++void meta_screen_cast_virtual_stream_set_monitor_identity (MetaScreenCastVirtualStream *virtual_stream,
++                                                           const char                  *vendor,
++                                                           const char                  *product,
++                                                           const char                  *serial);
++
++/* Returns FALSE when the client did not name the monitor. */
++gboolean meta_screen_cast_virtual_stream_get_monitor_identity (MetaScreenCastVirtualStream  *virtual_stream,
++                                                               const char                  **vendor,
++                                                               const char                  **product,
++                                                               const char                  **serial);

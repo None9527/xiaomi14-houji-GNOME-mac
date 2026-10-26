@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Radio switches
+Comment=Bluetooth and airplane mode switches backed by the phone
+Exec=/usr/local/libexec/ubuntu26-rfkill
+OnlyShowIn=GNOME;
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-GNOME-AutoRestart=true

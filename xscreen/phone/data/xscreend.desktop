@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=XScreen extended display
+Comment=Serves a virtual monitor to the Mac over USB while a viewer is connected
+Exec=/usr/local/bin/xscreend
+NoDisplay=true

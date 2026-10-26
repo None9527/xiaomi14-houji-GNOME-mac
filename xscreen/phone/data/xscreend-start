@@ -1,0 +1,6 @@
+#!/bin/sh
+# Starts xscreend detached from the caller, logging to the desktop state dir.
+log="${XDG_STATE_HOME:-$HOME/.local/state}/xscreend.log"
+mkdir -p "$(dirname "$log")"
+[ -s "$log" ] && mv -f "$log" "$log.1"
+exec setsid -f /usr/local/bin/xscreend "$@" >"$log" 2>&1 </dev/null

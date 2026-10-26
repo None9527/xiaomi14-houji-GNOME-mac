@@ -1,0 +1,208 @@
+#!/usr/bin/python3
+"""Process-scoped desktop Polkit agent for chroot sessions without logind.
+Passwords remain in the local PAM conversation; no allow-YES policy.
+"""
+import os, sys, time
+import socket, struct, pwd
+from pathlib import Path
+import gi
+gi.require_version('Gtk', '3.0')
+gi.require_version('Gdk', '3.0')
+gi.require_version('Polkit', '1.0')
+gi.require_version('PolkitAgent', '1.0')
+from gi.repository import Gtk, Gdk, Gio, GLib, Polkit, PolkitAgent
+
+# Autostart can run this before the compositor accepts clients. GTK only
+# initializes at import, and an agent without a display would leave every
+# pkexec waiting forever, so start over until the display is there.
+if Gdk.Display.get_default() is None:
+    attempt = int(os.environ.get('UBUNTU26_AUTH_AGENT_ATTEMPT', '0'))
+    if attempt >= 60:
+        sys.exit('ubuntu26-auth-agent: no display for the authentication dialog')
+    os.environ['UBUNTU26_AUTH_AGENT_ATTEMPT'] = str(attempt + 1)
+    time.sleep(0.5)
+    os.execv(sys.executable, [sys.executable, *sys.argv])
+
+XML = """<node><interface name="org.freedesktop.PolicyKit1.AuthenticationAgent">
+<method name="BeginAuthentication"><arg type="s" direction="in"/><arg type="s" direction="in"/>
+<arg type="s" direction="in"/><arg type="a{ss}" direction="in"/><arg type="s" direction="in"/>
+<arg type="a(sa{sv})" direction="in"/></method>
+<method name="CancelAuthentication"><arg type="s" direction="in"/></method>
+</interface></node>"""
+bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+owner_proxy = Gio.DBusProxy.new_sync(bus, Gio.DBusProxyFlags.NONE, None,
+    'org.freedesktop.PolicyKit1', '/org/freedesktop/PolicyKit1/Authority',
+    'org.freedesktop.PolicyKit1.Authority', None)
+authority = Polkit.Authority.get_sync(None)
+pending = {}
+
+def method_call(connection, sender, path, interface, method, params, invocation):
+    if sender != owner_proxy.get_name_owner():
+        invocation.return_dbus_error('org.freedesktop.DBus.Error.AccessDenied', 'Polkit only')
+        return
+    args = params.unpack()
+    if method == 'CancelAuthentication':
+        session = pending.get(args[0])
+        if session: session.cancel()
+        invocation.return_value(GLib.Variant('()', ()))
+        return
+    action, message, icon, details, cookie, identities = args
+    own_identity = any(kind == 'unix-user' and props.get('uid') == os.getuid()
+                       for kind, props in identities)
+    if not own_identity:
+        invocation.return_dbus_error('org.freedesktop.PolicyKit1.Error.Cancelled',
+                                     'Unsupported authentication identity')
+        return
+    # Polkit waits for this call to return: never leave it unanswered.
+    try:
+        begin_authentication(invocation, message, cookie)
+    except Exception as error:
+        pending.pop(cookie, None)
+        print('Authentication dialog failed: %s' % error, flush=True)
+        invocation.return_dbus_error('org.freedesktop.PolicyKit1.Error.Failed', str(error))
+
+def begin_authentication(invocation, message, cookie):
+    session = PolkitAgent.Session.new(Polkit.UnixUser.new(os.getuid()), cookie)
+    pending[cookie] = session
+    dialog = Gtk.Dialog(title='需要管理员认证', modal=True)
+    dialog.set_default_size(480, 180)
+    dialog.add_button('取消', Gtk.ResponseType.CANCEL)
+    dialog.add_button('认证', Gtk.ResponseType.OK)
+    dialog.set_default_response(Gtk.ResponseType.OK)
+    box = dialog.get_content_area()
+    box.set_border_width(20)
+    label = Gtk.Label(label=message + '\n\n请输入 ' + pwd.getpwuid(os.getuid()).pw_name + ' 的密码。')
+    label.set_line_wrap(True)
+    box.add(label)
+    entry = Gtk.Entry()
+    entry.set_visibility(False)
+    entry.set_activates_default(True)
+    entry.set_input_purpose(Gtk.InputPurpose.PASSWORD)
+    box.add(entry)
+    status = Gtk.Label()
+    status.set_line_wrap(True)
+    box.add(status)
+    state = {'waiting': False, 'done': False}
+    def response(_d, response_id):
+        if response_id != Gtk.ResponseType.OK:
+            session.cancel()
+        elif state['waiting']:
+            secret = entry.get_text()
+            entry.set_text('')
+            state['waiting'] = False
+            entry.set_sensitive(False)
+            session.response(secret)
+            secret = None
+    def request(_s, prompt, echo):
+        state['waiting'] = True
+        entry.set_sensitive(True)
+        entry.set_visibility(echo)
+        entry.set_text('')
+        status.set_text(prompt)
+        dialog.show_all()
+        dialog.present()
+        entry.grab_focus()
+    def completed(_s, gained):
+        if state['done']: return
+        state['done'] = True
+        entry.set_text('')
+        dialog.destroy()
+        pending.pop(cookie, None)
+        invocation.return_value(GLib.Variant('()', ()))
+    dialog.connect('response', response)
+    session.connect('request', request)
+    session.connect('show-error', lambda _s, text: status.set_text(text))
+    session.connect('show-info', lambda _s, text: status.set_text(text))
+    session.connect('completed', completed)
+    session.initiate()
+
+info = Gio.DBusNodeInfo.new_for_xml(XML).interfaces[0]
+bus.register_object('/local/ubuntu26/DesktopAuthentication', info, method_call, None, None)
+
+registrations = {}
+last_owner = None
+own_ns = os.readlink('/proc/self/ns/mnt')
+def register_process(pid):
+    p = Path('/proc') / str(pid)
+    if p.stat().st_uid != os.getuid() or os.readlink(p/'ns/mnt') != own_ns:
+        raise PermissionError('Process is outside this desktop')
+    start = int((p/'stat').read_text().rsplit(')', 1)[1].split()[19])
+    key = (pid, start)
+    if key not in registrations:
+        subject = Polkit.UnixProcess.new_for_owner(pid, start, os.getuid())
+        authority.register_authentication_agent_sync(subject, 'zh_CN.UTF-8',
+            '/local/ubuntu26/DesktopAuthentication', None)
+        registrations[key] = subject
+    return key
+
+# A launcher can synchronously register itself before forking pkexec. The
+# stock pkexec checks its parent PID, so this closes the short-process race.
+control_path = '/run/user/' + str(os.getuid()) + '/ubuntu26-auth-agent.sock'
+control = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+if os.path.lexists(control_path):
+    old = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        old.connect(control_path)
+    except ConnectionRefusedError:
+        os.unlink(control_path)
+    else:
+        raise RuntimeError('A desktop authentication agent is already running')
+    finally:
+        old.close()
+control.bind(control_path)
+os.chmod(control_path, 0o600)
+control.listen(16)
+control.setblocking(False)
+def incoming(fd, condition):
+    conn, _ = control.accept()
+    try:
+        pid, uid, gid = struct.unpack('3i', conn.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
+        conn.settimeout(2)
+        if uid != os.getuid() or conn.recv(64) != b'register\n':
+            conn.sendall(b'DENIED\n')
+        else:
+            register_process(pid)
+            conn.sendall(b'OK\n')
+    except (OSError, ValueError, GLib.Error):
+        try: conn.sendall(b'DENIED\n')
+        except OSError: pass
+    finally:
+        conn.close()
+    return True
+GLib.io_add_watch(control.fileno(), GLib.IO_IN, incoming)
+
+def refresh():
+    global last_owner
+    owner = owner_proxy.get_name_owner()
+    if owner != last_owner:
+        registrations.clear()
+        last_owner = owner
+    if not owner: return True
+    found = set()
+    for p in Path('/proc').iterdir():
+        if not p.name.isdigit(): continue
+        try:
+            if p.stat().st_uid != os.getuid(): continue
+            if (p/'comm').read_text().strip() != 'gnome-software': continue
+            key = register_process(int(p.name))
+            found.add(key)
+        except (OSError, ValueError):
+            continue
+        except GLib.Error as e:
+            print('Authentication registration failed: ' + e.message, flush=True)
+    for key in list(registrations):
+        try:
+            stat = (Path('/proc')/str(key[0])/'stat').read_text().rsplit(')',1)[1].split()
+            alive = int(stat[19]) == key[1]
+        except (OSError,ValueError):
+            alive = False
+        if not alive:
+            subject = registrations.pop(key)
+            try: authority.unregister_authentication_agent_sync(subject,
+                '/local/ubuntu26/DesktopAuthentication', None)
+            except GLib.Error: pass
+    return True
+refresh()
+GLib.timeout_add_seconds(2, refresh)
+Gtk.main()

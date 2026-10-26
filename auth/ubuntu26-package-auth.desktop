@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Desktop Authentication
+Exec=/usr/local/libexec/ubuntu26-auth-agent
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-GNOME-AutoRestart=true

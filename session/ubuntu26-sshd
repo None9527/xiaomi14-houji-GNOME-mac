@@ -1,0 +1,5 @@
+#!/bin/bash
+set -eu
+install -d -m 0755 /run/sshd
+/usr/sbin/sshd -t
+exec /usr/sbin/sshd -D -e

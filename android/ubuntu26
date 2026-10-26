@@ -1,0 +1,154 @@
+#!/data/adb/ksu/bin/busybox sh
+# Ubuntu 26.04 on Xiaomi 14. Run through: su -M -c '/data/local/ubuntu26/ubuntu26 ...'
+set -eu
+BASE=/data/local/ubuntu26
+ROOT=$BASE/rootfs
+IMAGE=$BASE/ubuntu26.ext4
+SELF=$BASE/ubuntu26
+BB=/data/adb/ksu/bin/busybox
+
+fail() { echo "ubuntu26: $*" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || fail 'Run through su -M.'
+[ -x "$BB" ] || fail 'KernelSU BusyBox is missing.'
+[ -d "$BASE" ] && [ ! -L "$BASE" ] || fail 'Invalid installation directory.'
+
+lock() {
+    exec 9>"$BASE/.mount.lock"
+    "$BB" flock -x 9
+}
+
+mounted() { "$BB" mountpoint -q "$ROOT"; }
+
+start_image() {
+    [ -f "$IMAGE" ] && [ ! -L "$IMAGE" ] || fail 'Rootfs image is missing.'
+    # Loop I/O runs as kernel:s0; system_data_file is denied under Enforcing.
+    chcon u:object_r:ksu_file:s0 "$IMAGE"
+    chmod 600 "$IMAGE"
+    mkdir -p "$ROOT"
+    mounted && return 0
+    loop=$(/system/bin/losetup -j "$IMAGE" | "$BB" head -n 1 | "$BB" cut -d: -f1)
+    created=0
+    if [ -z "$loop" ]; then
+        loop=$(/system/bin/losetup -f -s "$IMAGE")
+        created=1
+    fi
+    # The image is fully allocated so Ubuntu's space is reserved on /data.
+    # Never let discards punch holes in it and hand that space back.
+    echo 0 > "/sys/block/${loop##*/}/queue/discard_max_bytes" 2>/dev/null || true
+    if ! "$BB" mount -t ext4 -o rw,noatime "$loop" "$ROOT"; then
+        [ "$created" = 0 ] || /system/bin/losetup -d "$loop"
+        fail 'Cannot mount rootfs.'
+    fi
+}
+
+session() {
+    # This command inherits the setup lock and a private mount namespace.
+    mkdir -p "$ROOT/dev" "$ROOT/proc" "$ROOT/sys" "$ROOT/run" "$ROOT/tmp"
+    "$BB" mount -t tmpfs -o mode=0755,nosuid tmpfs "$ROOT/dev"
+    mkdir -p "$ROOT/dev/pts" "$ROOT/dev/shm"
+    for node in null zero random urandom tty full fuse; do
+        [ -e "/dev/$node" ] || continue
+        touch "$ROOT/dev/$node"
+        "$BB" mount -o bind "/dev/$node" "$ROOT/dev/$node"
+    done
+    # Expose graphics nodes only inside this private mount namespace.
+    if [ -c /dev/kgsl-3d0 ]; then
+        touch "$ROOT/dev/kgsl-3d0"
+        "$BB" mount -o bind /dev/kgsl-3d0 "$ROOT/dev/kgsl-3d0"
+    fi
+    for directory in dri dma_heap; do
+        if [ -d "/dev/$directory" ]; then
+            mkdir -p "$ROOT/dev/$directory"
+            "$BB" mount -o bind "/dev/$directory" "$ROOT/dev/$directory"
+        fi
+    done
+    # Qualcomm VPU (msm_vidc) codec nodes for hardware video encoding. Fresh
+    # nodes on the private tmpfs, so Android's own /dev keeps its modes.
+    for v in /sys/class/video4linux/video*; do
+        case "$(readlink "$v/device/driver" 2>/dev/null)" in *msm_vidc*) ;; *) continue;; esac
+        IFS=: read -r major minor < "$v/dev"
+        "$BB" mknod -m 0660 "$ROOT/dev/${v##*/}" c "$major" "$minor"
+        chown 0:44 "$ROOT/dev/${v##*/}"
+    done
+    # Share only Anland's IPC directory, leaving other Termux files private.
+    if [ -d /data/data/com.termux/files/usr/tmp/anland ]; then
+        mkdir -p "$ROOT/tmp/anland"
+        "$BB" mount -o bind /data/data/com.termux/files/usr/tmp/anland "$ROOT/tmp/anland"
+    fi
+    "$BB" mount -t devpts -o newinstance,ptmxmode=0666,mode=0620,gid=5 devpts "$ROOT/dev/pts"
+    ln -s pts/ptmx "$ROOT/dev/ptmx"
+    ln -s /proc/self/fd "$ROOT/dev/fd"
+    ln -s /proc/self/fd/0 "$ROOT/dev/stdin"
+    ln -s /proc/self/fd/1 "$ROOT/dev/stdout"
+    ln -s /proc/self/fd/2 "$ROOT/dev/stderr"
+    "$BB" mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs "$ROOT/dev/shm"
+    "$BB" mount -t proc -o nosuid,nodev,noexec proc "$ROOT/proc"
+    "$BB" mount -t sysfs -o ro,nosuid,nodev,noexec sysfs "$ROOT/sys"
+    "$BB" mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs "$ROOT/run"
+    mkdir -p "$ROOT/run/lock"
+    chmod 1777 "$ROOT/tmp" "$ROOT/run/lock"
+    # fuser can now see the session before the setup lock is released.
+    cd "$ROOT"
+    "$BB" flock -u 9
+    exec 9>&-
+    # Android's BACKGROUND allowlist otherwise blocks the unregistered Linux UID.
+    # Keep this scoped to Ubuntu UID 60000; preserve every other firewall rule.
+    if [ -f "$ROOT/usr/local/sbin/ubuntu26-network-allow.py" ]; then
+        "$BB" env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            /system/bin/chroot "$ROOT" /usr/bin/python3 \
+            /usr/local/sbin/ubuntu26-network-allow.py --quiet || \
+            echo 'Warning: could not apply Ubuntu background networking allowance' >&2
+    fi
+    if [ "$#" = 0 ]; then
+        set -- /bin/bash -l
+    fi
+    exec "$BB" env -i HOME=/root USER=root LOGNAME=root SHELL=/bin/bash \
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        TERM="${TERM:-xterm-256color}" LANG=C.UTF-8 TMPDIR=/tmp \
+        /system/bin/chroot "$ROOT" "$@"
+}
+
+command=${1:-enter}
+[ "$#" = 0 ] || shift
+case "$command" in
+    start)
+        lock
+        start_image
+        echo 'Ubuntu rootfs mounted.'
+        ;;
+    enter|exec)
+        lock
+        start_image
+        exec "$BB" unshare -m --propagation private "$SELF" _session "$@"
+        ;;
+    _session)
+        session "$@"
+        ;;
+    stop)
+        lock
+        if ! mounted; then
+            echo 'Ubuntu rootfs is already stopped.'
+            exit 0
+        fi
+        processes=$("$BB" fuser -m "$ROOT" 2>/dev/null || true)
+        [ -z "$processes" ] || fail "Exit Ubuntu sessions and services first. PIDs: $processes"
+        loop=$("$BB" awk -v r="$ROOT" '$2 == r { print $1; exit }' /proc/mounts)
+        "$BB" umount "$ROOT"
+        /system/bin/losetup -d "$loop"
+        echo 'Ubuntu rootfs unmounted; image retained.'
+        ;;
+    status)
+        if mounted; then
+            echo 'Ubuntu rootfs: mounted'
+            "$BB" df -h "$ROOT"
+            processes=$("$BB" fuser -m "$ROOT" 2>/dev/null || true)
+            echo "Session/service PIDs: ${processes:-none}"
+        else
+            echo 'Ubuntu rootfs: stopped'
+        fi
+        ;;
+    *)
+        echo 'Usage: ubuntu26 [enter|exec COMMAND...|start|stop|status]' >&2
+        exit 2
+        ;;
+esac

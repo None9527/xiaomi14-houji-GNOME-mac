@@ -1,0 +1,133 @@
+#!/data/adb/ksu/bin/busybox sh
+# Root-only control for services in separate Ubuntu mount namespaces.
+set -eu
+BB=/data/adb/ksu/bin/busybox
+BASE=/data/local/ubuntu26
+ROOT=$BASE/rootfs
+[ "$(id -u)" = 0 ] || exit 1
+service=${1:-status}
+action=${2:-status}
+mkdir -p "$BASE/run" "$BASE/logs"
+chmod 700 "$BASE/run" "$BASE/logs"
+if [ "$service" = status ]; then
+    "$0" ssh status
+    "$0" gnome status
+    exit
+fi
+case "$service" in ssh) target=/usr/local/sbin/ubuntu26-sshd;; gnome) target=/usr/local/sbin/ubuntu26-gnome;; *) exit 2;; esac
+state=$BASE/run/$service
+wrapper_alive() {
+    [ -s "$state" ] || return 1
+    read -r pid namespace < "$state"
+    [ "$(readlink "/proc/$pid/root" 2>/dev/null)" = "$ROOT" ] &&
+      [ "$(readlink "/proc/$pid/ns/mnt" 2>/dev/null)" = "$namespace" ]
+}
+healthy() {
+    wrapper_alive || return 1
+    [ "$service" = gnome ] || return 0
+    for candidate in $("$BB" fuser -m "$ROOT" 2>/dev/null || true); do
+        [ "$(cat "/proc/$candidate/comm" 2>/dev/null)" = gnome-shell ] || continue
+        [ "$(readlink "/proc/$candidate/ns/mnt" 2>/dev/null)" = "$namespace" ] || continue
+        [ "$(readlink "/proc/$candidate/root" 2>/dev/null)" = "$ROOT" ] && return 0
+    done
+    return 1
+}
+# Balanced desktop tuning while GNOME runs. The GPU power-collapses when
+# idle, so a clock floor only applies while it works, where the governor
+# otherwise stays at its lowest step through short desktop animations and
+# streaming to the Mac jitters. gnome-shell gets a utilization floor, which
+# likewise only applies while it runs.
+KGSL=/sys/class/kgsl/kgsl-3d0
+GPU_FLOOR_HZ=366000000
+SHELL_UCLAMP_MIN=250
+gpu_saved=$BASE/run/gpu-min-pwrlevel
+tune_session() {
+    level=0
+    for f in $(cat "$KGSL/devfreq/available_frequencies"); do
+        if [ "$f" = "$GPU_FLOOR_HZ" ]; then
+            [ -s "$gpu_saved" ] || cat "$KGSL/min_pwrlevel" > "$gpu_saved"
+            echo "$level" > "$KGSL/min_pwrlevel" || true
+            break
+        fi
+        level=$((level+1))
+    done
+    i=0
+    while [ "$i" -lt 120 ]; do
+        for candidate in $("$BB" fuser -m "$ROOT" 2>/dev/null || true); do
+            [ "$(cat "/proc/$candidate/comm" 2>/dev/null)" = gnome-shell ] || continue
+            [ "$(readlink "/proc/$candidate/ns/mnt" 2>/dev/null)" = "$namespace" ] || continue
+            # /proc of the chroot is only mounted inside the desktop's namespace.
+            "$BB" nsenter -t "$candidate" -m "$BB" chroot "$ROOT" \
+              /usr/bin/uclampset -a -m "$SHELL_UCLAMP_MIN" -p "$candidate"
+            return 0
+        done
+        sleep 0.5
+        i=$((i+1))
+    done
+}
+untune_session() {
+    [ -s "$gpu_saved" ] || return 0
+    cat "$gpu_saved" > "$KGSL/min_pwrlevel" || true
+    rm -f "$gpu_saved"
+}
+case "$action" in
+    start)
+        if healthy; then echo "$service already running: $pid"; exit; fi
+        if wrapper_alive; then
+            echo "$service compositor is gone; cleaning stale session"
+            "$0" "$service" stop
+        fi
+        # Keep the previous session's log for post-mortems.
+        [ ! -s "$BASE/logs/$service.log" ] || mv -f "$BASE/logs/$service.log" "$BASE/logs/$service.log.1"
+        "$BB" nohup "$BB" setsid "$BASE/ubuntu26" exec "$target" \
+          > "$BASE/logs/$service.log" 2>&1 < /dev/null &
+        pid=$!
+        i=0
+        while [ "$i" -lt 50 ]; do
+            if [ "$(readlink "/proc/$pid/root" 2>/dev/null)" = "$ROOT" ]; then
+                namespace=$(readlink "/proc/$pid/ns/mnt")
+                echo "$pid $namespace" > "$state"
+                echo "$service started: $pid"
+                if [ "$service" = gnome ]; then
+                    "$BB" nohup "$BB" setsid "$0" gnome tune > /dev/null 2>&1 < /dev/null &
+                fi
+                exit 0
+            fi
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.1
+            i=$((i+1))
+        done
+        echo "$service failed; see $BASE/logs/$service.log" >&2
+        exit 1
+        ;;
+    stop)
+        if ! wrapper_alive; then rm -f "$state"; echo "$service stopped"; exit; fi
+        # Match the private mount namespace, including detached desktop children.
+        # Other Ubuntu shells and the other service use different namespaces.
+        pids=
+        candidates=$("$BB" fuser -m "$ROOT" 2>/dev/null || true)
+        for candidate in $candidates; do
+            entry=/proc/$candidate
+            [ "$(readlink "$entry/ns/mnt" 2>/dev/null)" = "$namespace" ] || continue
+            [ "$(readlink "$entry/root" 2>/dev/null)" = "$ROOT" ] || continue
+            pids="$pids ${entry##*/}"
+        done
+        [ -z "$pids" ] || kill -TERM $pids 2>/dev/null || true
+        sleep 1
+        for p in $pids; do
+            [ "$(readlink "/proc/$p/ns/mnt" 2>/dev/null)" = "$namespace" ] || continue
+            kill -KILL "$p" 2>/dev/null || true
+        done
+        rm -f "$state"
+        [ "$service" != gnome ] || untune_session
+        echo "$service stopped"
+        ;;
+    tune)
+        wrapper_alive || exit 1
+        tune_session
+        ;;
+    status)
+        if healthy; then echo "$service running: $pid ($namespace)"; elif wrapper_alive; then echo "$service failed: compositor exited ($pid)"; else echo "$service stopped"; fi
+        ;;
+    *) echo 'Usage: ubuntu26-service [status|ssh start|stop|status|gnome start|stop|tune|status]' >&2; exit 2;;
+esac

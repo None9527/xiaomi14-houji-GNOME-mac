@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+/usr/bin/install -d -m 0755 /run/systemd
+exec /usr/lib/systemd/systemd-hostnamed

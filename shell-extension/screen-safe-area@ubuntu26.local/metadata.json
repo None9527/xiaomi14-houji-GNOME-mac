@@ -1,0 +1,9 @@
+{
+  "uuid": "screen-safe-area@ubuntu26.local",
+  "name": "手机屏幕安全区域",
+  "description": "让顶栏和窗口避开手机屏幕的挖孔与圆角，随屏幕旋转自动调整。",
+  "shell-version": [
+    "50"
+  ],
+  "version": 1
+}

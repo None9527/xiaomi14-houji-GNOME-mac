@@ -1,0 +1,235 @@
+diff --git a/src/backends/anland/meta-backend-anland.c b/src/backends/anland/meta-backend-anland.c
+index ac7d0aa..86f2608 100644
+--- a/src/backends/anland/meta-backend-anland.c
++++ b/src/backends/anland/meta-backend-anland.c
+@@ -68,6 +68,13 @@ struct _MetaBackendAnland
+   int64_t pending_global_frame_counter;
+   int64_t pending_view_frame_counter;
+   unsigned int presentation_sequence;
++
++  /* The consumer hands buffers back in its own order, so each one carries
++   * an older frame. Tracking when each was last painted gives the stage a
++   * buffer age, and it repairs only the damage that buffer missed. */
++  uint64_t paint_sequence;
++  uint64_t buffer_painted_at[MAX_BUFS];
++  gboolean needs_full_redraw;
+ };
+ 
+ G_DEFINE_TYPE (MetaBackendAnland, meta_backend_anland, META_TYPE_BACKEND_NATIVE)
+@@ -388,6 +395,29 @@ uninhibit_frame_clock (MetaBackendAnland *backend)
+   backend->frame_clock_inhibited = FALSE;
+ }
+ 
++static void
++reset_buffer_ages (MetaBackendAnland *backend)
++{
++  backend->paint_sequence = 0;
++  memset (backend->buffer_painted_at, 0, sizeof backend->buffer_painted_at);
++  backend->needs_full_redraw = TRUE;
++
++  if (backend->stage_view)
++    meta_stage_view_set_external_buffer_age (backend->stage_view, 0);
++}
++
++static void
++update_buffer_age (MetaBackendAnland *backend)
++{
++  int buffer = backend->current_buffer;
++  int age = 0;
++
++  if (buffer >= 0 && backend->buffer_painted_at[buffer] > 0)
++    age = backend->paint_sequence - backend->buffer_painted_at[buffer] + 1;
++
++  meta_stage_view_set_external_buffer_age (backend->stage_view, age);
++}
++
+ static void
+ release_stage_view (MetaBackendAnland *backend)
+ {
+@@ -398,6 +428,7 @@ release_stage_view (MetaBackendAnland *backend)
+   g_return_if_fail (!backend->frame_pending);
+ 
+   uninhibit_frame_clock (backend);
++  meta_stage_view_set_external_buffer_age (backend->stage_view, -1);
+   g_clear_object (&backend->placeholder_framebuffer);
+   g_clear_object (&backend->stage_view);
+ }
+@@ -552,6 +583,7 @@ deactivate_consumer (MetaBackendAnland *backend)
+   backend->consumer_active = FALSE;
+   backend->current_buffer = -1;
+   backend->frame_pending = FALSE;
++  reset_buffer_ages (backend);
+   inhibit_frame_clock (backend);
+ }
+ 
+@@ -589,10 +621,15 @@ on_stage_view_present (ClutterStageView *stage_view,
+   meta_anland_transport_set_render_fence (backend->transport, fence_fd);
+   if (!meta_anland_transport_notify_frame_done (backend->transport))
+     {
++      /* The stage already stepped its damage history for this paint. */
++      reset_buffer_ages (backend);
+       clutter_frame_set_result (frame, CLUTTER_FRAME_RESULT_IDLE);
+       return TRUE;
+     }
+ 
++  if (backend->current_buffer >= 0)
++    backend->buffer_painted_at[backend->current_buffer] = ++backend->paint_sequence;
++
+   backend->pending_global_frame_counter = global_frame_counter;
+   backend->pending_view_frame_counter = clutter_frame_get_count (frame);
+   backend->frame_pending = TRUE;
+@@ -701,10 +738,18 @@ buffer_ready_source_dispatch (gpointer user_data)
+       backend->current_buffer = selected_buffer;
+     }
+ 
+-  clutter_stage_view_add_redraw_clip (CLUTTER_STAGE_VIEW (backend->stage_view),
+-                                      NULL);
++  update_buffer_age (backend);
+   uninhibit_frame_clock (backend);
+-  clutter_stage_view_schedule_update_now (CLUTTER_STAGE_VIEW (backend->stage_view));
++
++  /* Only paint when the stage has damage. A newly attached consumer has
++   * nothing on screen yet, so it gets one full frame. */
++  if (backend->needs_full_redraw)
++    {
++      backend->needs_full_redraw = FALSE;
++      clutter_stage_view_add_redraw_clip (CLUTTER_STAGE_VIEW (backend->stage_view),
++                                          NULL);
++      clutter_stage_view_schedule_update_now (CLUTTER_STAGE_VIEW (backend->stage_view));
++    }
+   return G_SOURCE_CONTINUE;
+ }
+ 
+@@ -819,6 +864,7 @@ activate_consumer (MetaBackendAnland *backend)
+   backend->consumer_active = TRUE;
+   meta_anland_clipboard_set_transport (backend->clipboard, backend->transport);
+   backend->current_buffer = -1;
++  reset_buffer_ages (backend);
+   inhibit_frame_clock (backend);
+   clutter_stage_view_set_present_func (CLUTTER_STAGE_VIEW (backend->stage_view),
+                                        on_stage_view_present, backend);
+diff --git a/src/backends/meta-stage-impl.c b/src/backends/meta-stage-impl.c
+index 738f315..4103e1c 100644
+--- a/src/backends/meta-stage-impl.c
++++ b/src/backends/meta-stage-impl.c
+@@ -463,9 +463,6 @@ should_use_clipped_redraw (gboolean              is_full_redraw,
+   if (paint_debug_flags & CLUTTER_DEBUG_DISABLE_CLIPPED_REDRAWS)
+     return FALSE;
+ 
+-  if (COGL_IS_OFFSCREEN (framebuffer))
+-    return TRUE;
+-
+   if (has_buffer_age && !buffer_has_valid_damage_history)
+     {
+       meta_topic (META_DEBUG_BACKEND,
+@@ -473,6 +470,9 @@ should_use_clipped_redraw (gboolean              is_full_redraw,
+       return FALSE;
+     }
+ 
++  if (COGL_IS_OFFSCREEN (framebuffer))
++    return TRUE;
++
+   can_blit_sub_buffer =
+     cogl_context_has_winsys_feature (context, COGL_WINSYS_FEATURE_SWAP_REGION);
+   can_use_clipped_redraw =
+@@ -525,6 +525,9 @@ meta_stage_impl_redraw_view_primary (MetaStageImpl    *stage_impl,
+   has_buffer_age =
+     COGL_IS_ONSCREEN (onscreen) &&
+     cogl_context_has_winsys_feature (context, COGL_WINSYS_FEATURE_BUFFER_AGE);
++  if (!has_buffer_age &&
++      meta_stage_view_get_external_buffer_age (view, &buffer_age))
++    has_buffer_age = TRUE;
+ 
+   redraw_clip = clutter_stage_view_take_accumulated_redraw_clip (stage_view);
+ 
+@@ -538,7 +541,8 @@ meta_stage_impl_redraw_view_primary (MetaStageImpl    *stage_impl,
+ 
+   if (has_buffer_age)
+     {
+-      buffer_age = cogl_onscreen_get_buffer_age (COGL_ONSCREEN (onscreen));
++      if (COGL_IS_ONSCREEN (onscreen))
++        buffer_age = cogl_onscreen_get_buffer_age (COGL_ONSCREEN (onscreen));
+       buffer_has_valid_damage_history =
+         clutter_damage_history_is_age_valid (damage_history,
+                                              buffer_age);
+diff --git a/src/backends/meta-stage-view-private.h b/src/backends/meta-stage-view-private.h
+index d379bfb..061327c 100644
+--- a/src/backends/meta-stage-view-private.h
++++ b/src/backends/meta-stage-view-private.h
+@@ -36,6 +36,12 @@ struct _MetaStageViewClass
+ };
+ 
+ ClutterDamageHistory * meta_stage_view_get_damage_history (MetaStageView *view);
++void meta_stage_view_set_external_buffer_age (MetaStageView *view,
++                                              int            age);
++
++gboolean meta_stage_view_get_external_buffer_age (MetaStageView *view,
++                                                  int           *age);
++
+ void meta_stage_view_perform_fake_swap (MetaStageView *view,
+                                         int64_t        global_frame_counter,
+                                         int64_t        view_frame_counter);
+diff --git a/src/backends/meta-stage-view.c b/src/backends/meta-stage-view.c
+index 41318b9..31be85b 100644
+--- a/src/backends/meta-stage-view.c
++++ b/src/backends/meta-stage-view.c
+@@ -36,6 +36,10 @@ typedef struct _MetaStageViewPrivate
+   CoglFrameClosure *frame_cb_closure;
+ 
+   int inhibit_cursor_overlay_count;
++
++  /* Age of the render target as reported by a backend that renders into
++   * framebuffers it swaps itself (not a CoglOnscreen); -1 when unknown. */
++  int external_buffer_age;
+ } MetaStageViewPrivate;
+ 
+ G_DEFINE_TYPE_WITH_PRIVATE (MetaStageView, meta_stage_view,
+@@ -151,6 +155,7 @@ meta_stage_view_init (MetaStageView *view)
+     meta_stage_view_get_instance_private (view);
+ 
+   priv->damage_history = clutter_damage_history_new ();
++  priv->external_buffer_age = -1;
+ }
+ 
+ static void
+@@ -175,6 +180,40 @@ meta_stage_view_get_damage_history (MetaStageView *view)
+   return priv->damage_history;
+ }
+ 
++/**
++ * meta_stage_view_set_external_buffer_age:
++ * @view: a #MetaStageView
++ * @age: age of the framebuffer the next frame renders into, 0 if its
++ *   contents are undefined, or -1 to stop tracking buffer age
++ *
++ * For backends that cycle through their own (non-onscreen) render targets.
++ * With an age set, the stage repairs only the damage the target missed,
++ * exactly like for an onscreen with EGL_EXT_buffer_age.
++ */
++void
++meta_stage_view_set_external_buffer_age (MetaStageView *view,
++                                         int            age)
++{
++  MetaStageViewPrivate *priv =
++    meta_stage_view_get_instance_private (view);
++
++  priv->external_buffer_age = age;
++}
++
++gboolean
++meta_stage_view_get_external_buffer_age (MetaStageView *view,
++                                         int           *age)
++{
++  MetaStageViewPrivate *priv =
++    meta_stage_view_get_instance_private (view);
++
++  if (priv->external_buffer_age < 0)
++    return FALSE;
++
++  *age = priv->external_buffer_age;
++  return TRUE;
++}
++
+ typedef struct _NotifyPresentedClosure
+ {
+   ClutterStageView *view;

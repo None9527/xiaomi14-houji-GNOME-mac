@@ -1,0 +1,12 @@
+#!/bin/sh
+# Nautilus script: sends the selected files and folders to the Mac showing
+# this desktop in XScreen; they arrive in its Downloads folder.
+uris=$(printf '%s' "$NAUTILUS_SCRIPT_SELECTED_URIS" |
+  awk 'NF { gsub(/\\/, "\\\\"); gsub(/\x27/, "\\\x27"); printf "%s\x27%s\x27", (n++ ? ", " : ""), $0 }')
+[ -n "$uris" ] || exit 0
+if ! out=$(gdbus call --session --dest local.xscreen.XScreen --object-path /local/xscreen/XScreen \
+             --method local.xscreen.XScreen.SendFiles "[$uris]" 2>&1); then
+  gdbus call --session --dest org.freedesktop.Notifications \
+    --object-path /org/freedesktop/Notifications --method org.freedesktop.Notifications.Notify \
+    XScreen 0 dialog-error "无法发送到 Mac" "${out##*: }" "[]" "{}" -1 >/dev/null
+fi

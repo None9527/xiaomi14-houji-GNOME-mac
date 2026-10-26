@@ -1,0 +1,20 @@
+#!/usr/bin/python3
+"""Keep stock pkexec/PAM semantics while providing a chroot desktop agent."""
+import os,socket,struct,subprocess,sys
+real='/usr/bin/pkexec'
+path='/run/user/'+str(os.getuid())+'/ubuntu26-auth-agent.sock'
+if os.getuid()==0 or not os.path.exists(path) or any(x in ['--help','--version'] for x in sys.argv[1:]):
+    os.execv(real,[real,*sys.argv[1:]])
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.settimeout(5)
+try:
+    s.connect(path)
+    peer=struct.unpack('3i',s.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,struct.calcsize('3i')))
+    if peer[1]!=os.getuid():raise PermissionError('Wrong authentication agent owner')
+    s.sendall(b'register\n')
+    if s.recv(16)!=b'OK\n':raise RuntimeError('Authentication agent registration failed')
+finally:s.close()
+# pkexec authenticates its parent. Keep this registered process alive and
+# preserve argv, environment, stdio and the stock command's exit status.
+try:result=subprocess.call([real,*sys.argv[1:]])
+except KeyboardInterrupt:sys.exit(130)
+sys.exit(result if result>=0 else 128-result)
