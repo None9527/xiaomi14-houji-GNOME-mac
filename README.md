@@ -11,14 +11,15 @@
 1. [效果一览](#效果一览)
 2. [整体架构](#整体架构)
 3. [前提条件](#前提条件)
-4. [仓库结构](#仓库结构)
-5. [各部分是怎么工作的](#各部分是怎么工作的)
-6. [安装部署](#安装部署)
-7. [日常使用](#日常使用)
-8. [从源码构建](#从源码构建)
-9. [排错与诊断](#排错与诊断)
-10. [已知限制](#已知限制)
-11. [上游与致谢](#上游与致谢)
+4. [手机上的完整目录布局](#手机上的完整目录布局)
+5. [仓库结构](#仓库结构)
+6. [各部分是怎么工作的](#各部分是怎么工作的)
+7. [安装部署](#安装部署)
+8. [日常使用](#日常使用)
+9. [从源码构建](#从源码构建)
+10. [排错与诊断](#排错与诊断)
+11. [已知限制](#已知限制)
+12. [上游与致谢](#上游与致谢)
 
 ---
 
@@ -80,7 +81,7 @@
 | 手机 | 小米 14（骁龙 8 Gen 3，Adreno 750，Android 的 kgsl GPU 驱动） |
 | Root | KernelSU（脚本使用 `/data/adb/ksu/bin/busybox`，并用 `su -M` 进入全局挂载命名空间） |
 | 显示 | [Anland: Termux](https://github.com/lfdevs/anland-termux) 5.13.x：Android 显示 App + Termux 守护进程 |
-| 容器 | Ubuntu 26.04 arm64 rootfs，放在 `/data/local/ubuntu26/ubuntu26.ext4`（ext4 镜像，loop 挂载） |
+| 容器 | Ubuntu 26.04 arm64 rootfs：镜像 `/data/local/ubuntu26/ubuntu26.ext4`（ext4，loop 挂载到 `/data/local/ubuntu26/rootfs`） |
 | 桌面 | Anland 发布的 Ubuntu 版 mutter（`50.1-0ubuntu91`），再打上本仓库的补丁 |
 | Mac | Apple Silicon，macOS 14+，Homebrew 的 `adb`（`android-platform-tools`），Xcode 命令行工具；可选 `scrcpy` |
 
@@ -88,29 +89,114 @@
 
 ---
 
+## 手机上的完整目录布局
+
+整套系统在手机上只占一个目录：`/data/local/ubuntu26`（root 所有，权限 700）。Ubuntu 的根文件系统挂在其中的 `rootfs` 下，所以**容器里的 `/X` 在 Android 上就是 `/data/local/ubuntu26/rootfs/X`**。下面每个文件同时给出两种写法：左边是 Android（`adb shell` / root shell）看到的完整路径，`#` 后面是它在容器里的路径和作用。
+
+```text
+/data/local/ubuntu26/                                   # 整套系统的根目录（Android 侧）
+├── ubuntu26                                            # 启动器：挂载镜像、进入容器（android/ubuntu26）
+├── ubuntu26-service                                    # 服务控制：gnome / ssh 启停、调优（android/ubuntu26-service）
+├── ubuntu26.ext4                                       # Ubuntu 根文件系统镜像，预分配 400 GiB
+├── bridge/
+│   ├── native-network-agent.jar                        # 无线电代理，在 Android 侧用 app_process 运行
+│   └── agent-startup.log                               # 代理启动日志
+├── run/                                                # 运行状态（服务启动时写入）
+│   ├── gnome                                           # GNOME 服务的 PID 和挂载命名空间
+│   ├── ssh                                             # SSH 服务的 PID 和挂载命名空间
+│   └── gpu-min-pwrlevel                                # 调优前的 GPU 最低档位，停止时据此还原
+├── logs/
+│   ├── gnome.log                                       # 本次 GNOME 会话的全部输出（gnome-shell、mutter）
+│   ├── gnome.log.1                                     # 上一次会话
+│   └── ssh.log
+└── rootfs/                                             # ← ubuntu26.ext4 挂载点 = 容器里的 /
+    ├── usr/local/sbin/
+    │   ├── ubuntu26-gnome                              # /usr/local/sbin/ubuntu26-gnome：桌面会话入口
+    │   ├── ubuntu26-sshd                               # /usr/local/sbin/ubuntu26-sshd：SSH 服务
+    │   └── ubuntu26-network-allow.py                   # /usr/local/sbin/ubuntu26-network-allow.py：后台联网放行
+    ├── usr/local/bin/
+    │   ├── startgnome-anland                           # /usr/local/bin/startgnome-anland：Anland 的 GNOME 启动脚本
+    │   ├── pkexec                                      # /usr/local/bin/pkexec：pkexec 垫片（排在 /usr/bin/pkexec 前）
+    │   ├── xscreend                                    # /usr/local/bin/xscreend：XScreen 手机端守护进程
+    │   └── xscreend-start                              # /usr/local/bin/xscreend-start：后台启动 xscreend 并写日志
+    ├── usr/local/libexec/
+    │   ├── ubuntu26-native-network                     # /usr/local/libexec/ubuntu26-native-network：无线电 D-Bus 服务
+    │   ├── ubuntu26-rfkill                             # /usr/local/libexec/ubuntu26-rfkill：rfkill 接口
+    │   ├── ubuntu26-system-disk                        # /usr/local/libexec/ubuntu26-system-disk：系统盘设备节点
+    │   ├── ubuntu26-auth-agent                         # /usr/local/libexec/ubuntu26-auth-agent：Polkit 认证代理
+    │   └── ubuntu26-hostnamed                          # /usr/local/libexec/ubuntu26-hostnamed：hostnamed 启动器
+    ├── usr/local/share/dbus-1/system-services/
+    │   └── org.freedesktop.hostname1.service           # hostnamed 的 D-Bus 按需启动
+    ├── usr/lib/aarch64-linux-gnu/
+    │   └── libvulkan_freedreno.so                      # 打过补丁的 Turnip（Vulkan）驱动
+    ├── usr/share/gnome-shell/extensions/
+    │   └── screen-safe-area@ubuntu26.local/            # 顶栏透明 / 避开挖孔与圆角的扩展
+    ├── etc/dbus-1/system.d/
+    │   ├── ubuntu26-radios.conf                        # ModemManager / BlueZ / 自定义接口的访问策略
+    │   └── org.freedesktop.NetworkManager.conf         # NetworkManager 接口的访问策略
+    ├── etc/xdg/autostart/
+    │   ├── ubuntu26-rfkill.desktop                     # 登录时启动 rfkill 接口
+    │   └── xscreend.desktop                            # 登录时启动 xscreend
+    ├── home/ubuntu/                                    # 桌面用户（none，UID 60000）的主目录
+    │   ├── .config/autostart/ubuntu26-package-auth.desktop   # 登录时启动认证代理
+    │   ├── .config/monitors.xml                        # GNOME 保存的显示器配置（按显示器身份）
+    │   ├── .local/share/applications/zcode.desktop     # ZCode 启动参数修正
+    │   ├── .local/share/nautilus/scripts/发送到 Mac    # “文件”右键 › 脚本 › 发送到 Mac
+    │   └── .local/state/
+    │       ├── xscreend.log                            # xscreend 日志（上一次为 xscreend.log.1）
+    │       └── anland/                                 # 无线电桥接、系统服务、Anland 的日志
+    ├── opt/xscreen/                                    # 在手机上构建用的工作目录
+    │   ├── phone/                                      # xscreend 源码（本仓库 xscreen/phone）与 build/
+    │   ├── protocol/                                   # xs-protocol.h（本仓库 xscreen/protocol）
+    │   ├── build/                                      # mutter 源码与构建出的 .deb
+    │   └── backup/                                     # 替换系统文件前的备份（不要放在 lib 目录里）
+    ├── tmp/anland/display_daemon.sock                  # ← 绑定自 Termux 的 /data/data/com.termux/files/usr/tmp/anland
+    └── dev/                                            # 每个会话私有的 tmpfs，只绑定需要的设备：
+                                                        #   kgsl-3d0（GPU）、dri/、dma_heap/、高通视频编解码节点（如 video33）
+```
+
+其他会用到的 Android 侧路径：
+
+| 路径 | 用途 |
+| --- | --- |
+| `/data/adb/ksu/bin/busybox` | KernelSU 自带的 busybox，启动脚本都用它 |
+| `/data/data/com.termux/files/usr/tmp/anland/` | Anland 守护进程的 socket 目录，绑定进容器的 `/tmp/anland` |
+| `/sys/class/kgsl/kgsl-3d0/min_pwrlevel` | GPU 最低频率档位（调优时修改，停止时还原） |
+| `/proc/1/root/sys/fs/bpf/netd_shared/map_netd_uid_owner_map` | Android 网络策略的 BPF 表（只为 UID 60000 加“允许后台”） |
+
+---
+
 ## 仓库结构
 
-每个目录对应一块功能；“装到哪里”一列是它在手机上的位置（`rootfs` 即 `/data/local/ubuntu26/rootfs`，也就是容器里的 `/`）。
+每个目录对应一块功能；“装到哪里”一列是它在手机上的完整路径（Android 侧看到的路径）。
 
 | 路径 | 作用 | 装到哪里 |
 | --- | --- | --- |
-| `android/ubuntu26` | 挂载镜像、建立私有挂载命名空间、进入容器 | `/data/local/ubuntu26/ubuntu26`（Android 侧） |
-| `android/ubuntu26-service` | GNOME / SSH 的启停与状态，负载调优 | `/data/local/ubuntu26/ubuntu26-service`（Android 侧） |
-| `session/ubuntu26-gnome` | 桌面会话入口：system D-Bus、系统盘、无线电桥接、启动 GNOME | rootfs `/usr/local/sbin/` |
-| `session/startgnome-anland` | Anland 的 GNOME 启动脚本（小改，见下文） | rootfs `/usr/local/bin/` |
-| `session/ubuntu26-sshd` | 容器内的 SSH 服务 | rootfs `/usr/local/sbin/` |
-| `session/ubuntu26-network-allow.py` | 让 Ubuntu 用户在 Android 后台网络策略下联网 | rootfs `/usr/local/sbin/` |
-| `session/ubuntu26-hostnamed`、`org.freedesktop.hostname1.service` | “设置 › 关于”所需的 hostnamed（D-Bus 按需启动） | rootfs `/usr/local/libexec/`、`/usr/local/share/dbus-1/system-services/` |
-| `patches/mutter/` | mutter 补丁 0021–0025 | 构建进 mutter 包 |
-| `patches/mesa/` | Turnip（Vulkan）在 kgsl 上的修复 | 构建进 `libvulkan_freedreno.so` |
-| `patches/deploy-mutter.sh` | 在手机上安装自建 mutter 包并重启 GNOME | Mac 上运行 |
-| `radios/` | Wi‑Fi / 蓝牙 / 移动数据 / 飞行模式的桌面集成 | 见[安装部署](#4-无线电网络蓝牙移动数据) |
-| `storage/ubuntu26-system-disk` | 让 UDisks 看到“Ubuntu 系统盘” | rootfs `/usr/local/libexec/` |
-| `shell-extension/screen-safe-area@ubuntu26.local/` | 透明顶栏，避开挖孔和圆角 | rootfs `/usr/share/gnome-shell/extensions/` |
-| `auth/` | 桌面密码认证（Polkit 代理 + pkexec 垫片） | 见[安装部署](#7-权限认证) |
-| `apps/zcode.desktop` | ZCode 的启动参数修正 | `~/.local/share/applications/` |
+| `android/ubuntu26` | 挂载镜像、建立私有挂载命名空间、进入容器 | `/data/local/ubuntu26/ubuntu26` |
+| `android/ubuntu26-service` | GNOME / SSH 的启停与状态，负载调优 | `/data/local/ubuntu26/ubuntu26-service` |
+| `session/ubuntu26-gnome` | 桌面会话入口：system D-Bus、系统盘、无线电桥接、启动 GNOME | `/data/local/ubuntu26/rootfs/usr/local/sbin/ubuntu26-gnome` |
+| `session/startgnome-anland` | Anland 的 GNOME 启动脚本（小改，见下文） | `/data/local/ubuntu26/rootfs/usr/local/bin/startgnome-anland` |
+| `session/ubuntu26-sshd` | 容器内的 SSH 服务 | `/data/local/ubuntu26/rootfs/usr/local/sbin/ubuntu26-sshd` |
+| `session/ubuntu26-network-allow.py` | 让 Ubuntu 用户在 Android 后台网络策略下联网 | `/data/local/ubuntu26/rootfs/usr/local/sbin/ubuntu26-network-allow.py` |
+| `session/ubuntu26-hostnamed` | “设置 › 关于”所需的 hostnamed 启动器 | `/data/local/ubuntu26/rootfs/usr/local/libexec/ubuntu26-hostnamed` |
+| `session/org.freedesktop.hostname1.service` | hostnamed 的 D-Bus 按需启动 | `/data/local/ubuntu26/rootfs/usr/local/share/dbus-1/system-services/org.freedesktop.hostname1.service` |
+| `patches/mutter/` | mutter 补丁 0021–0025 | 在 `/data/local/ubuntu26/rootfs/opt/xscreen/build` 构建成 mutter 包 |
+| `patches/mesa/` | Turnip（Vulkan）在 kgsl 上的修复 | 构建出 `/data/local/ubuntu26/rootfs/usr/lib/aarch64-linux-gnu/libvulkan_freedreno.so` |
+| `patches/deploy-mutter.sh` | 在手机上安装自建 mutter 包并重启 GNOME | 在 Mac 上运行 |
+| `radios/ubuntu26-native-network` | 无线电 D-Bus 服务 | `/data/local/ubuntu26/rootfs/usr/local/libexec/ubuntu26-native-network` |
+| `radios/ubuntu26-rfkill` | rfkill 接口 | `/data/local/ubuntu26/rootfs/usr/local/libexec/ubuntu26-rfkill` |
+| `radios/ubuntu26-rfkill.desktop` | rfkill 接口自启动 | `/data/local/ubuntu26/rootfs/etc/xdg/autostart/ubuntu26-rfkill.desktop` |
+| `radios/ubuntu26-radios.conf` | D-Bus 访问策略 | `/data/local/ubuntu26/rootfs/etc/dbus-1/system.d/ubuntu26-radios.conf` |
+| `radios/org.freedesktop.NetworkManager.conf` | D-Bus 访问策略 | `/data/local/ubuntu26/rootfs/etc/dbus-1/system.d/org.freedesktop.NetworkManager.conf` |
+| `radios/native-network-agent.jar` | Android 侧无线电代理（源码 `radios/agent/`） | `/data/local/ubuntu26/bridge/native-network-agent.jar` |
+| `storage/ubuntu26-system-disk` | 让 UDisks 看到“Ubuntu 系统盘” | `/data/local/ubuntu26/rootfs/usr/local/libexec/ubuntu26-system-disk` |
+| `shell-extension/screen-safe-area@ubuntu26.local/` | 透明顶栏，避开挖孔和圆角 | `/data/local/ubuntu26/rootfs/usr/share/gnome-shell/extensions/screen-safe-area@ubuntu26.local/` |
+| `auth/ubuntu26-auth-agent` | Polkit 认证代理 | `/data/local/ubuntu26/rootfs/usr/local/libexec/ubuntu26-auth-agent` |
+| `auth/pkexec` | pkexec 垫片 | `/data/local/ubuntu26/rootfs/usr/local/bin/pkexec` |
+| `auth/ubuntu26-package-auth.desktop` | 认证代理自启动 | `/data/local/ubuntu26/rootfs/home/ubuntu/.config/autostart/ubuntu26-package-auth.desktop` |
+| `apps/zcode.desktop` | ZCode 的启动参数修正 | `/data/local/ubuntu26/rootfs/home/ubuntu/.local/share/applications/zcode.desktop` |
 | `xscreen/protocol/` | XScreen 线协议（C 头文件，两端共用） | — |
-| `xscreen/phone/` | 手机端守护进程 `xscreend`（C，meson） | rootfs `/usr/local/bin/` 等 |
+| `xscreen/phone/` | 手机端守护进程 `xscreend`（C，meson） | 源码 `/data/local/ubuntu26/rootfs/opt/xscreen/phone`，安装位置见[安装部署](#8-xscreen) |
 | `xscreen/mac/` | Mac 应用 XScreen.app（Swift） | Mac |
 | `xscreen/scrcpy-server/` | 原版 scrcpy 客户端的兼容层与启动脚本 | Mac |
 | `xscreen/probe/` | 开发时用的采集/探测小工具 | — |
@@ -130,7 +216,7 @@ su -M -c '/data/local/ubuntu26/ubuntu26-service gnome start'
        └─ startgnome-anland → gnome-session → gnome-shell
 ```
 
-- **`ubuntu26`** 负责把 `ubuntu26.ext4` loop 挂到 `rootfs`，然后为每个会话 `unshare` 出一个私有挂载命名空间：`/dev`（只绑定需要的节点：GPU `kgsl-3d0`、`dri`、`dma_heap`、高通视频编解码节点）、`/proc`、`/sys`、`/run` 都只在这个命名空间里可见，Android 自己的视图不受影响。它还只把 Anland 的 IPC 目录共享进来，Termux 其他文件保持私有。
+- **`ubuntu26`** 负责把 `/data/local/ubuntu26/ubuntu26.ext4` loop 挂到 `/data/local/ubuntu26/rootfs`，然后为每个会话 `unshare` 出一个私有挂载命名空间：`/dev`（只绑定需要的节点：GPU `kgsl-3d0`、`dri`、`dma_heap`、高通视频编解码节点）、`/proc`、`/sys`、`/run` 都只在这个命名空间里可见，Android 自己的视图不受影响。它还只把 Anland 的 IPC 目录共享进来，Termux 其他文件保持私有。
 - **`ubuntu26-service`** 记录每个服务的 PID 和挂载命名空间，用它们来判断“真的在运行”（不只是看 PID），停止时只杀属于这个命名空间的进程。`gnome` 启动后会自动执行一次 `tune`。
 - **均衡调优**（`tune`）：GNOME 运行期间把 GPU 最低频率设到 366 MHz（GPU 空闲时照样掉电，下限只在工作时生效，避免短动画和推流时卡在最低档）；给 gnome-shell 设 `uclamp.min=250`。停止 GNOME 时还原。
 - **联网**：Android 的后台网络策略会拦截没注册过的 Linux UID。`ubuntu26-network-allow.py` 只在 netd 的 BPF 表里给 Ubuntu 的 UID 60000 加一个“允许后台”标记，不动其他任何规则。
@@ -159,7 +245,7 @@ lfdevs 的 Mesa 分支（`dev/adreno-main`）在 kgsl 上提交命令时会写�
 原则：**Android 始终是无线电的唯一拥有者**，桌面只是一个“遥控器”。
 
 - `radios/ubuntu26-native-network`（root 运行的 Python）在 system bus 上实现了 GNOME 需要的接口：`org.freedesktop.NetworkManager`（Wi‑Fi 与移动网络）、`org.freedesktop.ModemManager1`、`org.bluez`，以及我们自己的 `local.ubuntu26.Radios`、`local.ubuntu26.Display`（后者把屏幕挖孔、圆角、旋转告诉顶栏扩展）。
-- 真正的操作由 `radios/agent/NetAgent.java` 完成：它通过 Android 的 `app_process` 在 Android 侧运行，调用系统 API（需要 `ActivityThread.initializeMainlineModules` 才能拿到 Telephony/Bluetooth 服务；设置项走 `settings` 命令）。编译好的 `native-network-agent.jar` 放在 Android 侧的 `/data/local/ubuntu26/bridge/`。
+- 真正的操作由 `radios/agent/NetAgent.java` 完成：它通过 Android 的 `app_process` 在 Android 侧运行，调用系统 API（需要 `ActivityThread.initializeMainlineModules` 才能拿到 Telephony/Bluetooth 服务；设置项走 `settings` 命令）。编译好的 jar 放在 Android 侧的 `/data/local/ubuntu26/bridge/native-network-agent.jar`。
 - `radios/ubuntu26-rfkill` 在 session bus 上替代 gnome-settings-daemon 的 rfkill 接口，让快速设置里的开关、飞行模式与手机状态一致。
 - `radios/ubuntu26-radios.conf`、`org.freedesktop.NetworkManager.conf` 是对应的 D-Bus 访问策略。
 
@@ -177,7 +263,7 @@ lfdevs 的 Mesa 分支（`dev/adreno-main`）在 kgsl 上提交命令时会写�
 - 横屏时用 strut 让窗口避开挖孔区域；
 - 时钟位置保持不动。
 
-### 7. 权限认证
+### 7. 权限认证与应用修正
 
 容器里没有 logind，GNOME Shell 自带的 Polkit 认证代理注册不上，`pkexec` / 软件安装会一直等。
 
@@ -216,11 +302,7 @@ lfdevs 的 Mesa 分支（`dev/adreno-main`）在 kgsl 上提交命令时会写�
 
 > 下面假设 Anland + Ubuntu 26.04 chroot 已经能启动 GNOME。所有手机侧命令都需要 root。替换正在使用的文件时，用“复制到旁边再改名”的方式（Ubuntu 26 的 uutils `install` 不能覆盖正在运行的文件）。
 
-约定：
-
-```bash
-ROOT=/data/local/ubuntu26/rootfs     # 手机上 Ubuntu 的根目录
-```
+下面所有路径都是 Android 侧的完整路径（在 `adb shell` 里 `su` 之后使用）。容器里的同一个文件，去掉开头的 `/data/local/ubuntu26/rootfs` 即可。
 
 ### 1. 启动脚本（Android 侧）
 
@@ -231,7 +313,14 @@ adb shell "su -M -c 'cp /data/local/tmp/ubuntu26 /data/local/tmp/ubuntu26-servic
 
 ### 2. 桌面会话
 
-把 `session/` 下的文件放到上表对应位置（`ubuntu26-gnome`、`ubuntu26-sshd`、`ubuntu26-network-allow.py` → `$ROOT/usr/local/sbin/`；`startgnome-anland` → `$ROOT/usr/local/bin/`；`ubuntu26-hostnamed` → `$ROOT/usr/local/libexec/`；`org.freedesktop.hostname1.service` → `$ROOT/usr/local/share/dbus-1/system-services/`），并加可执行权限。
+| 文件 | 完整路径 | 权限 |
+| --- | --- | --- |
+| `session/ubuntu26-gnome` | `/data/local/ubuntu26/rootfs/usr/local/sbin/ubuntu26-gnome` | 755 |
+| `session/ubuntu26-sshd` | `/data/local/ubuntu26/rootfs/usr/local/sbin/ubuntu26-sshd` | 755 |
+| `session/ubuntu26-network-allow.py` | `/data/local/ubuntu26/rootfs/usr/local/sbin/ubuntu26-network-allow.py` | 755 |
+| `session/startgnome-anland` | `/data/local/ubuntu26/rootfs/usr/local/bin/startgnome-anland` | 755 |
+| `session/ubuntu26-hostnamed` | `/data/local/ubuntu26/rootfs/usr/local/libexec/ubuntu26-hostnamed` | 755 |
+| `session/org.freedesktop.hostname1.service` | `/data/local/ubuntu26/rootfs/usr/local/share/dbus-1/system-services/org.freedesktop.hostname1.service` | 644 |
 
 ### 3. mutter 与 Mesa
 
@@ -241,55 +330,59 @@ adb shell "su -M -c 'cp /data/local/tmp/ubuntu26 /data/local/tmp/ubuntu26-servic
 patches/deploy-mutter.sh
 ```
 
-它会安装 `/opt/xscreen/build` 里的包并重启 GNOME。
+它会安装 `/data/local/ubuntu26/rootfs/opt/xscreen/build` 里的包并重启 GNOME。
 
-> ⚠️ 不要把旧的 `.so` 备份放在 `/usr/lib/aarch64-linux-gnu` 里。`ldconfig` 会把它当成库，把 `libmutter` 的软链接指错，gnome-shell 就起不来了。备份请放到别处（我们用 `/opt/xscreen/backup/`）。
+> ⚠️ 不要把旧的 `.so` 备份放在 `/data/local/ubuntu26/rootfs/usr/lib/aarch64-linux-gnu` 里。`ldconfig` 会把它当成库，把 `libmutter` 的软链接指错，gnome-shell 就起不来了。备份请放到别处（我们用 `/data/local/ubuntu26/rootfs/opt/xscreen/backup/`）。
 
 ### 4. 无线电（网络、蓝牙、移动数据）
 
-| 文件 | 位置 |
-| --- | --- |
-| `radios/ubuntu26-native-network`、`ubuntu26-rfkill` | `$ROOT/usr/local/libexec/`（755） |
-| `radios/ubuntu26-radios.conf`、`org.freedesktop.NetworkManager.conf` | `$ROOT/etc/dbus-1/system.d/` |
-| `radios/ubuntu26-rfkill.desktop` | `$ROOT/etc/xdg/autostart/` |
-| `radios/native-network-agent.jar` | `/data/local/ubuntu26/bridge/`（Android 侧，400） |
+| 文件 | 完整路径 | 权限 |
+| --- | --- | --- |
+| `radios/ubuntu26-native-network` | `/data/local/ubuntu26/rootfs/usr/local/libexec/ubuntu26-native-network` | 755 |
+| `radios/ubuntu26-rfkill` | `/data/local/ubuntu26/rootfs/usr/local/libexec/ubuntu26-rfkill` | 755 |
+| `radios/ubuntu26-radios.conf` | `/data/local/ubuntu26/rootfs/etc/dbus-1/system.d/ubuntu26-radios.conf` | 644 |
+| `radios/org.freedesktop.NetworkManager.conf` | `/data/local/ubuntu26/rootfs/etc/dbus-1/system.d/org.freedesktop.NetworkManager.conf` | 644 |
+| `radios/ubuntu26-rfkill.desktop` | `/data/local/ubuntu26/rootfs/etc/xdg/autostart/ubuntu26-rfkill.desktop` | 644 |
+| `radios/native-network-agent.jar` | `/data/local/ubuntu26/bridge/native-network-agent.jar` | 400 |
 
 `radios/install.sh` 是当初从旧方案迁移时用的脚本（会顺带删除旧的 android-connectivity 扩展），可作参考。
 
 ### 5. 存储
 
-```
-storage/ubuntu26-system-disk → $ROOT/usr/local/libexec/（755）
-```
+| 文件 | 完整路径 | 权限 |
+| --- | --- | --- |
+| `storage/ubuntu26-system-disk` | `/data/local/ubuntu26/rootfs/usr/local/libexec/ubuntu26-system-disk` | 755 |
 
-镜像本身用 `fallocate` 预分配到想要的大小（我们是 400 GiB），再 `resize2fs`。`ubuntu26` 会自动关闭 discard。
+镜像 `/data/local/ubuntu26/ubuntu26.ext4` 用 `fallocate` 预分配到想要的大小（我们是 400 GiB），再 `resize2fs`。`ubuntu26` 会自动关闭 discard。
 
 ### 6. 顶栏扩展
 
-```
-shell-extension/screen-safe-area@ubuntu26.local → $ROOT/usr/share/gnome-shell/extensions/
-```
+| 文件 | 完整路径 |
+| --- | --- |
+| `shell-extension/screen-safe-area@ubuntu26.local/` | `/data/local/ubuntu26/rootfs/usr/share/gnome-shell/extensions/screen-safe-area@ubuntu26.local/` |
 
 然后在“扩展”应用里启用，或：`gnome-extensions enable screen-safe-area@ubuntu26.local`。
 
-### 7. 权限认证
+### 7. 权限认证与应用修正
 
-| 文件 | 位置 |
-| --- | --- |
-| `auth/ubuntu26-auth-agent` | `$ROOT/usr/local/libexec/`（755） |
-| `auth/pkexec` | `$ROOT/usr/local/bin/`（755） |
-| `auth/ubuntu26-package-auth.desktop` | `~/.config/autostart/`（桌面用户） |
+| 文件 | 完整路径 | 权限 |
+| --- | --- | --- |
+| `auth/ubuntu26-auth-agent` | `/data/local/ubuntu26/rootfs/usr/local/libexec/ubuntu26-auth-agent` | 755 |
+| `auth/pkexec` | `/data/local/ubuntu26/rootfs/usr/local/bin/pkexec` | 755 |
+| `auth/ubuntu26-package-auth.desktop` | `/data/local/ubuntu26/rootfs/home/ubuntu/.config/autostart/ubuntu26-package-auth.desktop` | 644，属主 60000 |
+| `apps/zcode.desktop` | `/data/local/ubuntu26/rootfs/home/ubuntu/.local/share/applications/zcode.desktop` | 644，属主 60000 |
 
 ### 8. XScreen
 
 手机端（在容器里构建，见下一节）：
 
-| 文件 | 位置 |
-| --- | --- |
-| `xscreend`（构建产物） | `$ROOT/usr/local/bin/` |
-| `xscreen/phone/data/xscreend-start` | `$ROOT/usr/local/bin/` |
-| `xscreen/phone/data/xscreend.desktop` | `$ROOT/etc/xdg/autostart/` |
-| `xscreen/phone/data/发送到 Mac` | `~/.local/share/nautilus/scripts/`（桌面用户，755） |
+| 文件 | 完整路径 | 权限 |
+| --- | --- | --- |
+| `xscreen/phone/` 源码 | `/data/local/ubuntu26/rootfs/opt/xscreen/phone/`（`xscreen/protocol/` 放到 `/data/local/ubuntu26/rootfs/opt/xscreen/protocol/`） | — |
+| `xscreend`（构建产物） | `/data/local/ubuntu26/rootfs/usr/local/bin/xscreend` | 755 |
+| `xscreen/phone/data/xscreend-start` | `/data/local/ubuntu26/rootfs/usr/local/bin/xscreend-start` | 755 |
+| `xscreen/phone/data/xscreend.desktop` | `/data/local/ubuntu26/rootfs/etc/xdg/autostart/xscreend.desktop` | 644 |
+| `xscreen/phone/data/发送到 Mac` | `/data/local/ubuntu26/rootfs/home/ubuntu/.local/share/nautilus/scripts/发送到 Mac` | 755，属主 60000 |
 
 Mac 端：
 
@@ -351,7 +444,7 @@ git clone https://github.com/lfdevs/mutter.git      # 版本 50.1-0ubuntu91
 dpkg-buildpackage -b -uc -us
 ```
 
-我们在手机上的 `/opt/xscreen/build` 里构建，产物由 `patches/deploy-mutter.sh` 安装。
+我们在手机上的 `/data/local/ubuntu26/rootfs/opt/xscreen/build`（容器里的 `/opt/xscreen/build`）里构建，产物由 `patches/deploy-mutter.sh` 安装。
 
 ### Mesa（Turnip）
 
@@ -360,17 +453,18 @@ git clone https://github.com/lfdevs/mesa-for-android-container.git   # 分支 de
 git apply patches/mesa/0001-turnip-kgsl-skip-protected-ccu-regs.patch
 ```
 
-按该仓库的说明构建 freedreno Vulkan 驱动（kgsl），替换 `/usr/lib/aarch64-linux-gnu/libvulkan_freedreno.so`（原文件备份到 lib 目录之外）。
+按该仓库的说明构建 freedreno Vulkan 驱动（kgsl），替换 `/data/local/ubuntu26/rootfs/usr/lib/aarch64-linux-gnu/libvulkan_freedreno.so`（原文件备份到 `/data/local/ubuntu26/rootfs/opt/xscreen/backup/`，不要留在 lib 目录里）。
 
 ### xscreend（在手机容器里）
 
 ```bash
 apt install meson ninja-build pkgconf libglib2.0-dev libpipewire-0.3-dev libei-dev \
             libegl-dev libgles-dev libdrm-dev
-cd xscreen/phone
+cd /opt/xscreen/phone        # Android 侧即 /data/local/ubuntu26/rootfs/opt/xscreen/phone
 meson setup build
 ninja -C build
 meson test -C build          # 单元测试：损伤跟踪、scrcpy 协议
+cp build/xscreend /usr/local/bin/xscreend.new && mv -f /usr/local/bin/xscreend.new /usr/local/bin/xscreend
 ```
 
 ### Mac 应用
@@ -398,9 +492,11 @@ java -cp r8lib.jar com.android.tools.r8.D8 --release --min-api 31 --lib android.
 
 | 内容 | 位置 |
 | --- | --- |
-| GNOME（gnome-shell、mutter） | `/data/local/ubuntu26/logs/gnome.log`（上一次的在 `gnome.log.1`） |
-| xscreend | 容器内 `/home/ubuntu/.local/state/xscreend.log` |
-| 无线电桥接、系统服务 | 容器内 `/home/ubuntu/.local/state/anland/` |
+| GNOME（gnome-shell、mutter） | `/data/local/ubuntu26/logs/gnome.log`（上一次的在 `/data/local/ubuntu26/logs/gnome.log.1`） |
+| xscreend | `/data/local/ubuntu26/rootfs/home/ubuntu/.local/state/xscreend.log`（上一次的在 `xscreend.log.1`） |
+| 无线电桥接、系统服务 | `/data/local/ubuntu26/rootfs/home/ubuntu/.local/state/anland/` |
+| 无线电代理（Android 侧） | `/data/local/ubuntu26/bridge/agent-startup.log` |
+| GNOME 保存的显示器配置 | `/data/local/ubuntu26/rootfs/home/ubuntu/.config/monitors.xml` |
 
 **XScreen 的诊断开关**
 
