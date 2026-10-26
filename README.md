@@ -263,7 +263,7 @@ lfdevs 的 Mesa 分支（`dev/adreno-main`）在 kgsl 上提交命令时会写�
 - 横屏时用 strut 让窗口避开挖孔区域；
 - 时钟位置保持不动。
 
-### 7. 权限认证与应用修正
+### 7. 权限认证
 
 容器里没有 logind，GNOME Shell 自带的 Polkit 认证代理注册不上，`pkexec` / 软件安装会一直等。
 
