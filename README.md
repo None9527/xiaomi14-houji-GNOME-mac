@@ -387,9 +387,11 @@ patches/deploy-mutter.sh
 Mac 端：
 
 ```bash
-xscreen/mac/bundle.sh                 # 生成 xscreen/mac/build/XScreen.app
-open xscreen/mac/build/XScreen.app
+xscreen/mac/bundle.sh --install       # 构建并安装到 /Applications/XScreen.app
+open /Applications/XScreen.app
 ```
+
+之后从“启动台”、Spotlight 或程序坞打开即可。不加 `--install` 只生成 `xscreen/mac/build/XScreen.app`。
 
 ---
 
@@ -470,7 +472,8 @@ cp build/xscreend /usr/local/bin/xscreend.new && mv -f /usr/local/bin/xscreend.n
 ### Mac 应用
 
 ```bash
-xscreen/mac/bundle.sh
+xscreen/mac/bundle.sh             # 只构建
+xscreen/mac/bundle.sh --install   # 构建并替换 /Applications/XScreen.app
 ```
 
 ### 两个 Android 侧小 jar

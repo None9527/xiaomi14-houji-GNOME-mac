@@ -1,5 +1,6 @@
 #!/bin/bash
-# Builds XScreen.app from the SwiftPM product.
+# Builds XScreen.app from the SwiftPM product. With --install, also replaces
+# /Applications/XScreen.app (quitting a running copy first).
 set -euo pipefail
 cd "$(dirname "$0")"
 swift build -c release 2>&1 | grep -E "error|Build complete"; [ ${PIPESTATUS[0]} -eq 0 ] || exit 1
@@ -25,3 +26,12 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 PLIST
 codesign --force --sign - "$app" >/dev/null 2>&1 || true
 echo "built $app"
+if [ "${1:-}" = --install ]; then
+  if pgrep -x XScreen >/dev/null; then
+    osascript -e 'quit app "XScreen"' >/dev/null 2>&1 || true
+    while pgrep -x XScreen >/dev/null; do sleep 0.2; done
+  fi
+  rm -rf /Applications/XScreen.app
+  ditto "$app" /Applications/XScreen.app
+  echo "installed /Applications/XScreen.app"
+fi
